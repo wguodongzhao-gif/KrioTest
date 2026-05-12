@@ -1,14 +1,51 @@
 //@version=5
-indicator("资深技术策略师 AI 终端 Pro (All-in-One)", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+indicator("多周期技术策略面板 Pro v2.0", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
 
-// ==================== 输入参数 ====================
+// ============================================================================
+// v2.0 更新说明
+// ----------------------------------------------------------------------------
+// [更新 1] 修复 ATR 止损/止盈线与标签重复创建问题：改为 var 对象 + line.set / label.set 实时更新。
+// [更新 2] 修正 Ichimoku 云层逻辑：交易判断使用 senkouA[displacement] / senkouB[displacement]，与当前图上云层对齐。
+// [更新 3] 修正 in_the_cloud 判断：兼容多头云与空头云。
+// [更新 4] VWAP 改为 ta.vwap(hlc3)，且仅在日内周期参与评分。
+// [更新 5] RSI 评分拆分为多空方向，不再给多空双方同时加中性分。
+// [更新 6] 背离改为 Pivot Confirmed Divergence，减少误报。
+// [更新 7] FVG / OB 使用数组控制数量，避免图表对象过多。
+// [更新 8] 多周期趋势优化：日 MA50、周 MA20、月 MA10，更适合波段交易。
+// [更新 9] 增加显示模式：简洁 / 趋势 / SMC / 完整，降低视觉噪音。
+// [更新 10] 将“自动化交易设置”更名为“ATR 风险参考线”，避免误解。
+// ============================================================================
+
+
+// ============================================================================
+// 0. 输入参数
+// ============================================================================
+
+grp_display = "显示设置"
+display_mode = input.string("完整", "显示模式", options=["简洁", "趋势", "SMC", "完整"], group=grp_display)
+show_panel = input.bool(true, "显示主信息面板", group=grp_display)
+show_guide = input.bool(true, "显示看图顺序提示", group=grp_display)
+show_risk_lines = input.bool(true, "显示ATR止盈止损参考线", group=grp_display)
+show_patterns = input.bool(true, "显示K线形态", group=grp_display)
+show_divergence = input.bool(true, "显示RSI背离", group=grp_display)
+
+is_simple_mode = display_mode == "简洁"
+is_trend_mode  = display_mode == "趋势"
+is_smc_mode    = display_mode == "SMC"
+is_full_mode   = display_mode == "完整"
+
+show_trend_tools = is_trend_mode or is_full_mode or is_simple_mode
+show_smc_tools   = is_smc_mode or is_full_mode
+
 grp_ma = "移动平均线设置"
 ma_fast_len   = input.int(20, "快速MA周期", minval=5, group=grp_ma)
 ma_mid_len    = input.int(50, "中速MA周期", minval=10, group=grp_ma)
 ma_slow_len   = input.int(100, "慢速MA周期", minval=20, group=grp_ma)
 ma_ultra_len  = input.int(200, "超慢MA周期", minval=50, group=grp_ma)
+show_ema_ribbon = input.bool(true, "显示EMA Ribbon", group=grp_ma)
 
 grp_bb = "布林带设置"
+show_bb   = input.bool(true, "显示布林带", group=grp_bb)
 bb_len    = input.int(20, "BB周期", minval=5, group=grp_bb)
 bb_mult   = input.float(2.0, "BB标准差倍数", minval=0.5, step=0.1, group=grp_bb)
 
@@ -16,111 +53,184 @@ grp_rsi = "RSI设置"
 rsi_len   = input.int(14, "RSI周期", minval=5, group=grp_rsi)
 rsi_ob    = input.int(70, "超买阈值", minval=60, group=grp_rsi)
 rsi_os    = input.int(30, "超卖阈值", maxval=40, group=grp_rsi)
+div_left  = input.int(5, "背离Pivot左侧", minval=2, group=grp_rsi)
+div_right = input.int(5, "背离Pivot右侧", minval=2, group=grp_rsi)
 
 grp_ichi = "一目均衡设置"
 show_ichimoku = input.bool(true, "显示一目均衡云", group=grp_ichi)
-ichi_tenkan   = input.int(9, "转换线周期", group=grp_ichi)
-ichi_kijun    = input.int(26, "基准线周期", group=grp_ichi)
-ichi_senkou   = input.int(52, "先行带B周期", group=grp_ichi)
+ichi_tenkan   = input.int(9, "转换线周期", minval=1, group=grp_ichi)
+ichi_kijun    = input.int(26, "基准线/位移周期", minval=1, group=grp_ichi)
+ichi_senkou   = input.int(52, "先行带B周期", minval=1, group=grp_ichi)
 
 grp_smc = "Smart Money Concepts"
-show_smc      = input.bool(true, "显示市场结构", group=grp_smc)
-show_ob       = input.bool(true, "显示订单块 (Order Blocks)", group=grp_smc)
-show_fvg      = input.bool(true, "显示FVG (Fair Value Gap)", group=grp_smc)
-ob_lookback   = input.int(10, "订单块回溯周期", minval=5, group=grp_smc)
+show_market_structure = input.bool(true, "显示市场结构 BOS", group=grp_smc)
+show_ob       = input.bool(true, "显示订单块 OB", group=grp_smc)
+show_fvg      = input.bool(true, "显示FVG", group=grp_smc)
+swing_len     = input.int(5, "结构Swing周期", minval=2, group=grp_smc)
+max_ob_boxes  = input.int(20, "最多显示OB数量", minval=1, maxval=100, group=grp_smc)
+max_fvg_boxes = input.int(30, "最多显示FVG数量", minval=1, maxval=150, group=grp_smc)
 
 grp_signal = "信号系统"
 show_signals  = input.bool(true, "显示交易信号", group=grp_signal)
-min_score     = input.int(5, "最低信号分数 (1-10)", minval=1, maxval=10, group=grp_signal)
-grp_guide = "看图顺序提示"
-show_guide = input.bool(true, "显示看图顺序提示", group=grp_guide)
+min_score     = input.int(7, "最低信号分数 (1-10)", minval=1, maxval=10, group=grp_signal)
+confirm_on_close = input.bool(true, "仅收盘确认信号", group=grp_signal)
 
 grp_atr = "ATR & 风控"
 atr_len       = input.int(14, "ATR周期", group=grp_atr)
 atr_sl_mult   = input.float(2.0, "止损ATR倍数", step=0.1, group=grp_atr)
 atr_tp_mult   = input.float(3.0, "止盈ATR倍数", step=0.1, group=grp_atr)
 
-// ==================== 1. 移动平均线 (MA) + EMA Ribbon ====================
+
+// ============================================================================
+// 1. 基础指标：MA / EMA Ribbon
+// ============================================================================
+
 ma20  = ta.sma(close, ma_fast_len)
 ma50  = ta.sma(close, ma_mid_len)
 ma100 = ta.sma(close, ma_slow_len)
 ma200 = ta.sma(close, ma_ultra_len)
 
-// EMA Ribbon (趋势强度可视化)
 ema8   = ta.ema(close, 8)
 ema13  = ta.ema(close, 13)
 ema21  = ta.ema(close, 21)
 ema34  = ta.ema(close, 34)
 ema55  = ta.ema(close, 55)
 
-plot(ma20,  color=color.orange, title="MA20",  linewidth=1)
-plot(ma50,  color=color.blue,   title="MA50",  linewidth=1)
-plot(ma100, color=color.purple, title="MA100", linewidth=1)
-plot(ma200, color=color.red,    title="MA200", linewidth=2)
+plot(show_trend_tools ? ma20 : na,  color=color.orange, title="MA20",  linewidth=1)
+plot(show_trend_tools ? ma50 : na,  color=color.blue,   title="MA50",  linewidth=1)
+plot(show_trend_tools and not is_simple_mode ? ma100 : na, color=color.purple, title="MA100", linewidth=1)
+plot(show_trend_tools ? ma200 : na, color=color.red,    title="MA200", linewidth=2)
 
-// EMA Ribbon 填充
-p_ema8  = plot(ema8,  color=color.new(color.teal, 70), title="EMA8")
-p_ema55 = plot(ema55, color=color.new(color.teal, 70), title="EMA55")
-fill(p_ema8, p_ema55, color=ema8 > ema55 ? color.new(color.green, 85) : color.new(color.red, 85), title="EMA Ribbon")
+p_ema8  = plot(show_trend_tools and show_ema_ribbon and not is_simple_mode ? ema8 : na,  color=color.new(color.teal, 70), title="EMA8")
+p_ema55 = plot(show_trend_tools and show_ema_ribbon and not is_simple_mode ? ema55 : na, color=color.new(color.teal, 70), title="EMA55")
+fill(p_ema8, p_ema55, color=ema8 > ema55 ? color.new(color.green, 86) : color.new(color.red, 86), title="EMA Ribbon")
 
-// ==================== 2. 布林带 (Bollinger Bands) + Squeeze ====================
+
+// ============================================================================
+// 2. 布林带 + Squeeze
+// ============================================================================
+
 bb_basis = ta.sma(close, bb_len)
 bb_dev   = bb_mult * ta.stdev(close, bb_len)
 bb_upper = bb_basis + bb_dev
 bb_lower = bb_basis - bb_dev
 
-plot(bb_upper, color=color.new(color.gray, 50), title="BB Upper", style=plot.style_line)
-plot(bb_lower, color=color.new(color.gray, 50), title="BB Lower", style=plot.style_line)
+plot(show_trend_tools and show_bb and not is_simple_mode ? bb_upper : na, color=color.new(color.gray, 50), title="BB Upper")
+plot(show_trend_tools and show_bb and not is_simple_mode ? bb_basis : na, color=color.new(color.gray, 70), title="BB Basis")
+plot(show_trend_tools and show_bb and not is_simple_mode ? bb_lower : na, color=color.new(color.gray, 50), title="BB Lower")
 
-// Squeeze Momentum (布林带在肯特纳通道内 = 挤压状态)
 kc_basis = ta.sma(close, 20)
 kc_range = ta.atr(10)
 kc_upper = kc_basis + kc_range * 1.5
 kc_lower = kc_basis - kc_range * 1.5
-is_squeeze = (bb_lower > kc_lower) and (bb_upper < kc_upper)
+is_squeeze = bb_lower > kc_lower and bb_upper < kc_upper
 
-// ==================== 3. VWAP ====================
-vwap_val = ta.vwap
-plot(vwap_val, color=color.new(color.yellow, 30), title="VWAP", linewidth=2, style=plot.style_stepline)
 
-// ==================== 4. 一目均衡表 (Ichimoku Cloud) ====================
-tenkan  = (ta.highest(high, ichi_tenkan) + ta.lowest(low, ichi_tenkan)) / 2
-kijun   = (ta.highest(high, ichi_kijun) + ta.lowest(low, ichi_kijun)) / 2
-senkouA = (tenkan + kijun) / 2
-senkouB = (ta.highest(high, ichi_senkou) + ta.lowest(low, ichi_senkou)) / 2
+// ============================================================================
+// 3. VWAP
+// ============================================================================
+// [更新] VWAP 仅在日内周期显示与参与评分；日线及更高周期不参与。
 
-p_sa = plot(show_ichimoku ? senkouA : na, color=color.new(color.green, 70), title="Senkou A", offset=26)
-p_sb = plot(show_ichimoku ? senkouB : na, color=color.new(color.red, 70), title="Senkou B", offset=26)
+use_vwap = timeframe.isintraday
+vwap_val = ta.vwap(hlc3)
+plot(use_vwap and show_trend_tools ? vwap_val : na, color=color.new(color.yellow, 30), title="VWAP", linewidth=2, style=plot.style_stepline)
+
+
+// ============================================================================
+// 4. Ichimoku Cloud
+// ============================================================================
+
+tenkan  = (ta.highest(high, ichi_tenkan) + ta.lowest(low, ichi_tenkan)) / 2.0
+kijun   = (ta.highest(high, ichi_kijun) + ta.lowest(low, ichi_kijun)) / 2.0
+senkouA = (tenkan + kijun) / 2.0
+senkouB = (ta.highest(high, ichi_senkou) + ta.lowest(low, ichi_senkou)) / 2.0
+
+// [更新] 用于绘图的云向右位移。
+p_sa = plot(show_trend_tools and show_ichimoku ? senkouA : na, color=color.new(color.green, 70), title="Senkou A", offset=ichi_kijun)
+p_sb = plot(show_trend_tools and show_ichimoku ? senkouB : na, color=color.new(color.red, 70), title="Senkou B", offset=ichi_kijun)
 fill(p_sa, p_sb, color=senkouA > senkouB ? color.new(color.green, 90) : color.new(color.red, 90), title="Ichimoku Cloud")
 
-// ==================== 5. ATR (平均真实波幅) ====================
+plot(show_trend_tools and show_ichimoku and not is_simple_mode ? tenkan : na, color=color.new(color.aqua, 10), title="Tenkan")
+plot(show_trend_tools and show_ichimoku and not is_simple_mode ? kijun : na, color=color.new(color.fuchsia, 10), title="Kijun")
+
+// [更新] 用于当前K线判断的云，需要回看 displacement 根，才能与图上当前云层对齐。
+senkouA_now = senkouA[ichi_kijun]
+senkouB_now = senkouB[ichi_kijun]
+
+cloud_top = math.max(senkouA_now, senkouB_now)
+cloud_bot = math.min(senkouA_now, senkouB_now)
+
+price_above_cloud = not na(senkouA_now) and not na(senkouB_now) and close > cloud_top
+price_below_cloud = not na(senkouA_now) and not na(senkouB_now) and close < cloud_bot
+in_the_cloud      = not na(senkouA_now) and not na(senkouB_now) and close <= cloud_top and close >= cloud_bot
+
+cloud_bullish = not na(senkouA_now) and not na(senkouB_now) and senkouA_now > senkouB_now
+cloud_bearish = not na(senkouA_now) and not na(senkouB_now) and senkouA_now < senkouB_now
+
 atr_val = ta.atr(atr_len)
+cloud_thickness = not na(senkouA_now) and not na(senkouB_now) ? math.abs(senkouA_now - senkouB_now) : na
+cloud_strong = not na(cloud_thickness) and cloud_thickness > atr_val * 0.8
+
+tk_cross_bull = tenkan > kijun
+tk_cross_bear = tenkan < kijun
+
+
+// ============================================================================
+// 5. 成交量 / ADX / RSI / MACD
+// ============================================================================
+
 vol_ma20 = ta.sma(volume, 20)
 
-// ==================== 6. ADX (趋势强度) ====================
 adx_len = 14
 [di_plus, di_minus, adx_val] = ta.dmi(adx_len, adx_len)
 strong_trend = adx_val > 25
 
-// ==================== 7. 动能指标 (RSI & MACD) ====================
 rsi_val = ta.rsi(close, rsi_len)
 [macd_line, signal_line, macd_hist] = ta.macd(close, 12, 26, 9)
 
-// 增强版背离检测 (牛市 + 熊市)
-lookback_div = 14
-price_hh = ta.highest(high, lookback_div)[1]
-price_ll = ta.lowest(low, lookback_div)[1]
-rsi_hh   = ta.highest(rsi_val, lookback_div)[1]
-rsi_ll   = ta.lowest(rsi_val, lookback_div)[1]
+macd_bull = macd_line > signal_line
+macd_bear = macd_line < signal_line
+macd_hist_rising = macd_hist > macd_hist[1]
+macd_hist_falling = macd_hist < macd_hist[1]
 
-bear_div = (high > price_hh) and (rsi_val < rsi_hh) and (rsi_val > 60)
-bull_div = (low < price_ll) and (rsi_val > rsi_ll) and (rsi_val < 40)
 
-plotshape(bear_div, title="熊背离", style=shape.labeldown, location=location.abovebar, color=color.red, text="熊离", textcolor=color.white, size=size.small)
-plotshape(bull_div, title="牛背离", style=shape.labelup, location=location.belowbar, color=color.green, text="牛离", textcolor=color.white, size=size.small)
+// ============================================================================
+// 6. Pivot Confirmed RSI Divergence
+// ============================================================================
+// [更新] 旧版区间极值背离误报较多，改为 Pivot 确认背离。
+// 注意：Pivot 背离天然滞后 div_right 根K线，但可信度更高。
 
-// ==================== 8. 市场结构分析 (Smart Money Concepts) ====================
-swing_len = 5
+rsi_ph = ta.pivothigh(rsi_val, div_left, div_right)
+rsi_pl = ta.pivotlow(rsi_val, div_left, div_right)
+price_ph = ta.pivothigh(high, div_left, div_right)
+price_pl = ta.pivotlow(low, div_left, div_right)
+
+var float prev_price_ph = na
+var float prev_rsi_ph = na
+var float prev_price_pl = na
+var float prev_rsi_pl = na
+
+bear_div_confirmed = false
+bull_div_confirmed = false
+
+if not na(price_ph) and not na(rsi_ph)
+    bear_div_confirmed := not na(prev_price_ph) and price_ph > prev_price_ph and rsi_ph < prev_rsi_ph and rsi_ph > 50
+    prev_price_ph := price_ph
+    prev_rsi_ph := rsi_ph
+
+if not na(price_pl) and not na(rsi_pl)
+    bull_div_confirmed := not na(prev_price_pl) and price_pl < prev_price_pl and rsi_pl > prev_rsi_pl and rsi_pl < 50
+    prev_price_pl := price_pl
+    prev_rsi_pl := rsi_pl
+
+plotshape(show_divergence and bear_div_confirmed, title="确认熊背离", style=shape.labeldown, location=location.abovebar, color=color.red, text="熊背", textcolor=color.white, size=size.tiny, offset=-div_right)
+plotshape(show_divergence and bull_div_confirmed, title="确认牛背离", style=shape.labelup, location=location.belowbar, color=color.green, text="牛背", textcolor=color.white, size=size.tiny, offset=-div_right)
+
+
+// ============================================================================
+// 7. 市场结构：Swing / BOS
+// ============================================================================
+
 swing_high = ta.pivothigh(high, swing_len, swing_len)
 swing_low  = ta.pivotlow(low, swing_len, swing_len)
 
@@ -128,182 +238,228 @@ var float last_sh = na
 var float last_sl = na
 var int struct_dir = 0
 
+// [更新] 避免 nz(last_sh) 初期变成0导致的早期误判。
 if not na(swing_high)
-    if swing_high > nz(last_sh)
-        struct_dir := 1
-    else
-        struct_dir := -1
+    if not na(last_sh)
+        struct_dir := swing_high > last_sh ? 1 : -1
     last_sh := swing_high
 
 if not na(swing_low)
-    if swing_low > nz(last_sl)
-        struct_dir := 1
-    else
-        struct_dir := -1
+    if not na(last_sl)
+        struct_dir := swing_low > last_sl ? 1 : -1
     last_sl := swing_low
 
-// 结构突破 (Break of Structure)
-bos_bullish = not na(last_sh) and close > last_sh and close[1] <= nz(last_sh) and struct_dir == 1
-bos_bearish = not na(last_sl) and close < last_sl and close[1] >= nz(last_sl) and struct_dir == -1
+// [更新] BOS 加入 Ichimoku 当前云层过滤。
+bos_bullish = not na(last_sh) and close > last_sh and close[1] <= last_sh and struct_dir == 1 and price_above_cloud and cloud_bullish
+bos_bearish = not na(last_sl) and close < last_sl and close[1] >= last_sl and struct_dir == -1 and price_below_cloud and cloud_bearish
 
-plotshape(show_smc and bos_bullish, title="BOS多", style=shape.triangleup, location=location.belowbar, color=color.lime, text="BOS", textcolor=color.lime, size=size.tiny)
-plotshape(show_smc and bos_bearish, title="BOS空", style=shape.triangledown, location=location.abovebar, color=color.fuchsia, text="BOS", textcolor=color.fuchsia, size=size.tiny)
+plotshape(show_smc_tools and show_market_structure and bos_bullish, title="BOS多", style=shape.triangleup, location=location.belowbar, color=color.lime, text="BOS", textcolor=color.lime, size=size.tiny)
+plotshape(show_smc_tools and show_market_structure and bos_bearish, title="BOS空", style=shape.triangledown, location=location.abovebar, color=color.fuchsia, text="BOS", textcolor=color.fuchsia, size=size.tiny)
 
-// ==================== 9. 订单块 (Order Blocks) + FVG ====================
-// 看涨订单块: 大阳线前的最后一根阴线 (需要放量确认)
-bullish_ob = close[1] < open[1] and close > open and (close - open) > atr_val * 1.0 and volume > vol_ma20 * 1.2
-bearish_ob = close[1] > open[1] and close < open and (open - close) > atr_val * 1.0 and volume > vol_ma20 * 1.2
 
-// 记录订单块区域
-var float bull_ob_top = na
-var float bull_ob_bot = na
-var float bear_ob_top = na
-var float bear_ob_bot = na
+// ============================================================================
+// 8. OB / FVG，对象数量控制
+// ============================================================================
+// [更新] 使用 array 保存 box，并在超过上限后删除最旧对象。
 
-if show_ob and bullish_ob
-    box.new(bar_index - 1, high[1], bar_index + 20, low[1], bgcolor=color.new(color.green, 85), border_color=color.green, border_width=1)
-    bull_ob_top := high[1]
-    bull_ob_bot := low[1]
+var box[] ob_boxes = array.new_box()
+var box[] fvg_boxes = array.new_box()
 
-if show_ob and bearish_ob
-    box.new(bar_index - 1, high[1], bar_index + 20, low[1], bgcolor=color.new(color.red, 85), border_color=color.red, border_width=1)
-    bear_ob_top := high[1]
-    bear_ob_bot := low[1]
+// 更保守的 OB：必须配合 BOS 出现。
+bullish_ob = bos_bullish and close[1] < open[1] and volume > vol_ma20
+bearish_ob = bos_bearish and close[1] > open[1] and volume > vol_ma20
 
-// FVG (Fair Value Gap) 检测
-// 看涨FVG: 当前K线的低点 > 前2根K线的高点 (gap up)
+if show_smc_tools and show_ob and bullish_ob
+    b_ob = box.new(bar_index - 1, high[1], bar_index + 20, low[1], bgcolor=color.new(color.green, 86), border_color=color.green, border_width=1)
+    array.push(ob_boxes, b_ob)
+    if array.size(ob_boxes) > max_ob_boxes
+        old_ob = array.shift(ob_boxes)
+        box.delete(old_ob)
+
+if show_smc_tools and show_ob and bearish_ob
+    b_ob = box.new(bar_index - 1, high[1], bar_index + 20, low[1], bgcolor=color.new(color.red, 86), border_color=color.red, border_width=1)
+    array.push(ob_boxes, b_ob)
+    if array.size(ob_boxes) > max_ob_boxes
+        old_ob = array.shift(ob_boxes)
+        box.delete(old_ob)
+
+// FVG 定义
 bull_fvg = low > high[2] and close > open
-// 看跌FVG: 当前K线的高点 < 前2根K线的低点 (gap down)
 bear_fvg = high < low[2] and close < open
 
-var float bull_fvg_top = na
-var float bull_fvg_bot = na
-var float bear_fvg_top = na
-var float bear_fvg_bot = na
+if show_smc_tools and show_fvg and bull_fvg
+    b_fvg = box.new(bar_index - 1, low, bar_index + 15, high[2], bgcolor=color.new(color.teal, 88), border_color=color.teal, border_width=1)
+    array.push(fvg_boxes, b_fvg)
+    if array.size(fvg_boxes) > max_fvg_boxes
+        old_fvg = array.shift(fvg_boxes)
+        box.delete(old_fvg)
 
-if show_fvg and bull_fvg
-    box.new(bar_index - 1, low, bar_index + 15, high[2], bgcolor=color.new(color.teal, 88), border_color=color.teal, border_width=1)
-    bull_fvg_top := low
-    bull_fvg_bot := high[2]
+if show_smc_tools and show_fvg and bear_fvg
+    b_fvg = box.new(bar_index - 1, low[2], bar_index + 15, high, bgcolor=color.new(color.maroon, 88), border_color=color.maroon, border_width=1)
+    array.push(fvg_boxes, b_fvg)
+    if array.size(fvg_boxes) > max_fvg_boxes
+        old_fvg = array.shift(fvg_boxes)
+        box.delete(old_fvg)
 
-if show_fvg and bear_fvg
-    box.new(bar_index - 1, low[2], bar_index + 15, high, bgcolor=color.new(color.maroon, 88), border_color=color.maroon, border_width=1)
-    bear_fvg_top := low[2]
-    bear_fvg_bot := high
 
-// 价格回踩订单块/FVG检测
-price_at_bull_ob = not na(bull_ob_bot) and low <= bull_ob_top and close > bull_ob_bot
-price_at_bear_ob = not na(bear_ob_top) and high >= bear_ob_bot and close < bear_ob_top
-price_at_bull_fvg = not na(bull_fvg_bot) and low <= bull_fvg_top and close > bull_fvg_bot
-price_at_bear_fvg = not na(bear_fvg_top) and high >= bear_fvg_bot and close < bear_fvg_top
+// ============================================================================
+// 9. K线形态：有量确认版
+// ============================================================================
 
-// ==================== 10. K线形态识别 (有量确认版) ====================
 body_size = math.abs(close - open)
 upper_wick = high - math.max(close, open)
 lower_wick = math.min(close, open) - low
-is_hammer = (lower_wick > body_size * 2) and (upper_wick < body_size * 0.5) and (close > open) and (rsi_val < 40)
 
-// 吞没形态 - 必须有量确认
+is_hammer = lower_wick > body_size * 2 and upper_wick < body_size * 0.7 and close > open and rsi_val < 45
 has_volume = volume > vol_ma20 * 1.3
-bull_engulf = (close[1] < open[1]) and (close > open) and (close > open[1]) and (open < close[1]) and has_volume
-bear_engulf = (close[1] > open[1]) and (close < open) and (close < open[1]) and (open > close[1]) and has_volume
 
-is_doji = body_size < atr_val * 0.1
+bull_engulf = close[1] < open[1] and close > open and close > open[1] and open < close[1] and has_volume
+bear_engulf = close[1] > open[1] and close < open and close < open[1] and open > close[1] and has_volume
 
-// 删除晨星/黄昏星的小周期X信号, 只保留有量吞没和锤子
-plotshape(is_hammer, title="锤子", style=shape.diamond, location=location.belowbar, color=color.lime, text="锤", textcolor=color.lime, size=size.tiny)
-plotshape(bull_engulf, title="看涨吞没(有量)", style=shape.arrowup, location=location.belowbar, color=color.green, text="吞", textcolor=color.green, size=size.tiny)
-plotshape(bear_engulf, title="看跌吞没(有量)", style=shape.arrowdown, location=location.abovebar, color=color.red, text="吞", textcolor=color.red, size=size.tiny)
+plotshape(show_patterns and is_hammer, title="锤子", style=shape.diamond, location=location.belowbar, color=color.lime, text="锤", textcolor=color.lime, size=size.tiny)
+plotshape(show_patterns and bull_engulf, title="看涨吞没(有量)", style=shape.arrowup, location=location.belowbar, color=color.green, text="涨吞", textcolor=color.green, size=size.tiny)
+plotshape(show_patterns and bear_engulf, title="看跌吞没(有量)", style=shape.arrowdown, location=location.abovebar, color=color.red, text="跌吞", textcolor=color.red, size=size.tiny)
 
-// ==================== 11. 斐波那契回调与支撑阻力 ====================
-lookback_fib = 100
-highest_p = ta.highest(high, lookback_fib)
-lowest_p  = ta.lowest(low, lookback_fib)
-fib_diff = highest_p - lowest_p
 
-fib_236 = highest_p - (0.236 * fib_diff)
-fib_382 = highest_p - (0.382 * fib_diff)
-fib_500 = highest_p - (0.500 * fib_diff)
-fib_618 = highest_p - (0.618 * fib_diff)
-fib_786 = highest_p - (0.786 * fib_diff)
+// ============================================================================
+// 10. 多周期趋势
+// ============================================================================
+// [更新] 周线用 MA20，月线用 MA10，比月线 MA50 更适合A股波段交易。
+// [说明] lookahead_off 避免历史K线偷看未来高周期数据。
 
-if barstate.islast
-    line.new(bar_index - 50, highest_p, bar_index, highest_p, color=color.red, width=1, extend=extend.left)
-    line.new(bar_index - 50, fib_236, bar_index, fib_236, color=color.orange, width=1, style=line.style_dotted, extend=extend.left)
-    line.new(bar_index - 50, fib_382, bar_index, fib_382, color=color.orange, width=1, style=line.style_dotted, extend=extend.left)
-    line.new(bar_index - 50, fib_500, bar_index, fib_500, color=color.yellow, width=1, style=line.style_dotted, extend=extend.left)
-    line.new(bar_index - 50, fib_618, bar_index, fib_618, color=color.green, width=1, style=line.style_dotted, extend=extend.left)
-    line.new(bar_index - 50, fib_786, bar_index, fib_786, color=color.green, width=1, style=line.style_dotted, extend=extend.left)
-    line.new(bar_index - 50, lowest_p, bar_index, lowest_p, color=color.green, width=1, extend=extend.left)
-
-// ==================== 12. 多周期趋势 ====================
 d_close = request.security(syminfo.tickerid, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
 w_close = request.security(syminfo.tickerid, "W", close, barmerge.gaps_off, barmerge.lookahead_off)
 m_close = request.security(syminfo.tickerid, "M", close, barmerge.gaps_off, barmerge.lookahead_off)
 
-d_ma50 = request.security(syminfo.tickerid, "D", ta.sma(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
-w_ma50 = request.security(syminfo.tickerid, "W", ta.sma(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
-m_ma50 = request.security(syminfo.tickerid, "M", ta.sma(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+d_ma_trend = request.security(syminfo.tickerid, "D", ta.sma(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+w_ma_trend = request.security(syminfo.tickerid, "W", ta.sma(close, 20), barmerge.gaps_off, barmerge.lookahead_off)
+m_ma_trend = request.security(syminfo.tickerid, "M", ta.sma(close, 10), barmerge.gaps_off, barmerge.lookahead_off)
 
-d_trend = d_close > d_ma50 ? "多头" : "空头"
-w_trend = w_close > w_ma50 ? "多头" : "空头"
-m_trend = m_close > m_ma50 ? "多头" : "空头"
+d_bull = d_close > d_ma_trend
+w_bull = w_close > w_ma_trend
+m_bull = m_close > m_ma_trend
 
-d_bull = d_close > d_ma50
-w_bull = w_close > w_ma50
-m_bull = m_close > m_ma50
+d_trend = d_bull ? "多头" : "空头"
+w_trend = w_bull ? "多头" : "空头"
+m_trend = m_bull ? "多头" : "空头"
+
 all_bull_aligned = d_bull and w_bull and m_bull
 all_bear_aligned = not d_bull and not w_bull and not m_bull
 
 
-// ==================== 13. 综合信号评分系统 (趋势内+回踩确认版) ====================
-bull_score = (close > ma50 ? 1 : 0) + (close > ma200 ? 1 : 0) + ((rsi_val > rsi_os and rsi_val < rsi_ob) ? 1 : 0) + (macd_line > signal_line ? 1 : 0) + ((strong_trend and di_plus > di_minus) ? 1 : 0) + (d_bull ? 1 : 0) + (w_bull ? 1 : 0) + (close > vwap_val ? 1 : 0) + ((close > senkouA and close > senkouB) ? 1 : 0) + ((volume > vol_ma20 * 1.2 and close > open) ? 1 : 0)
+// ============================================================================
+// 11. 综合评分系统 v2：五大类评分
+// ============================================================================
+// [更新] 避免多个趋势指标重复计分造成“虚高评分”。
+// 每个方向最多 10 分：
+// 1. 大周期趋势 0-2
+// 2. 当前周期均线趋势 0-2
+// 3. 动能 0-2
+// 4. 量能 0-2
+// 5. 结构/位置 0-2
 
-bear_score = (close < ma50 ? 1 : 0) + (close < ma200 ? 1 : 0) + ((rsi_val < rsi_ob and rsi_val > rsi_os) ? 1 : 0) + (macd_line < signal_line ? 1 : 0) + ((strong_trend and di_minus > di_plus) ? 1 : 0) + (not d_bull ? 1 : 0) + (not w_bull ? 1 : 0) + (close < vwap_val ? 1 : 0) + ((close < senkouA and close < senkouB) ? 1 : 0) + ((volume > vol_ma20 * 1.2 and close < open) ? 1 : 0)
+bull_trend_score = (d_bull ? 1 : 0) + (w_bull ? 1 : 0)
+bear_trend_score = (not d_bull ? 1 : 0) + (not w_bull ? 1 : 0)
 
+bull_ma_score = (close > ma50 ? 1 : 0) + (close > ma200 ? 1 : 0)
+bear_ma_score = (close < ma50 ? 1 : 0) + (close < ma200 ? 1 : 0)
+
+bull_momentum_score = (macd_bull ? 1 : 0) + (rsi_val > 50 and rsi_val < rsi_ob ? 1 : 0)
+bear_momentum_score = (macd_bear ? 1 : 0) + (rsi_val < 50 and rsi_val > rsi_os ? 1 : 0)
+
+bull_volume_score = (volume > vol_ma20 ? 1 : 0) + (volume > vol_ma20 * 1.2 and close > open ? 1 : 0)
+bear_volume_score = (volume > vol_ma20 ? 1 : 0) + (volume > vol_ma20 * 1.2 and close < open ? 1 : 0)
+
+bull_structure_score = (price_above_cloud ? 1 : 0) + (struct_dir == 1 ? 1 : 0)
+bear_structure_score = (price_below_cloud ? 1 : 0) + (struct_dir == -1 ? 1 : 0)
+
+// VWAP作为日内微调，不纳入10分总分，避免日线图干扰。
+vwap_bias = use_vwap ? (close > vwap_val ? 1 : close < vwap_val ? -1 : 0) : 0
+
+bull_score = bull_trend_score + bull_ma_score + bull_momentum_score + bull_volume_score + bull_structure_score
+bear_score = bear_trend_score + bear_ma_score + bear_momentum_score + bear_volume_score + bear_structure_score
 net_score = bull_score - bear_score
 
-// === 趋势确认 ===
-uptrend_confirmed = close > ma50 and close > ma200 and d_bull and struct_dir == 1
-downtrend_confirmed = close < ma50 and close < ma200 and (not d_bull) and struct_dir == -1
+uptrend_confirmed = price_above_cloud and cloud_bullish and tk_cross_bull and struct_dir == 1
+downtrend_confirmed = price_below_cloud and cloud_bearish and tk_cross_bear and struct_dir == -1
 
-// === 回踩确认: 价格曾回踩MA20/MA50/订单块/FVG后反弹 ===
-pullback_to_support = (low <= ma20 or low <= ma50 or price_at_bull_ob or price_at_bull_fvg) and close > open
-pullback_to_resistance = (high >= ma20 or high >= ma50 or price_at_bear_ob or price_at_bear_fvg) and close < open
+// [更新] 回踩条件更严格：必须在趋势确认后，回踩关键均线并收回。
+pullback_to_support = uptrend_confirmed and low <= math.max(ma20, ma50) and close > ma20 and close > open and volume <= vol_ma20 * 2.0
+pullback_to_resistance = downtrend_confirmed and high >= math.min(ma20, ma50) and close < ma20 and close < open and volume <= vol_ma20 * 2.0
 
-// === 最终信号: 趋势中 + 回踩确认 + 高评分 ===
-signal_bull = show_signals and bull_score >= min_score and net_score >= 3 and uptrend_confirmed and pullback_to_support
-signal_bear = show_signals and bear_score >= min_score and net_score <= -3 and downtrend_confirmed and pullback_to_resistance
+bar_confirmed = confirm_on_close ? barstate.isconfirmed : true
 
-// 只在新信号出现时标注 (避免连续重复)
+signal_bull = show_signals and bar_confirmed and bull_score >= min_score and net_score >= 3 and uptrend_confirmed and pullback_to_support and not in_the_cloud
+signal_bear = show_signals and bar_confirmed and bear_score >= min_score and net_score <= -3 and downtrend_confirmed and pullback_to_resistance and not in_the_cloud
+
 plotshape(signal_bull and not signal_bull[1], title="BUY(趋势+回踩)", style=shape.labelup, location=location.belowbar, color=color.green, text="BUY", textcolor=color.white, size=size.normal)
 plotshape(signal_bear and not signal_bear[1], title="SELL(趋势+回踩)", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL", textcolor=color.white, size=size.normal)
 
-// ==================== 14. 自动化交易设置 (ATR动态止损) ====================
-is_bullish = close > ma50
+
+// ============================================================================
+// 12. ATR 风险参考线
+// ============================================================================
+// [更新] 这是 indicator，不是 strategy，因此这里只提供风险参考线，不宣称自动交易。
+
+is_bullish_context = bull_score >= bear_score
 
 entry_price = close
-sl_price = is_bullish ? close - (atr_val * atr_sl_mult) : close + (atr_val * atr_sl_mult)
-tp1_price = is_bullish ? close + (atr_val * atr_tp_mult) : close - (atr_val * atr_tp_mult)
-tp2_price = is_bullish ? close + (atr_val * atr_tp_mult * 2.0) : close - (atr_val * atr_tp_mult * 2.0)
-tp3_price = is_bullish ? close + (atr_val * atr_tp_mult * 3.0) : close - (atr_val * atr_tp_mult * 3.0)
+sl_price = is_bullish_context ? close - atr_val * atr_sl_mult : close + atr_val * atr_sl_mult
+tp1_price = is_bullish_context ? close + atr_val * atr_tp_mult : close - atr_val * atr_tp_mult
+tp2_price = is_bullish_context ? close + atr_val * atr_tp_mult * 2.0 : close - atr_val * atr_tp_mult * 2.0
+tp3_price = is_bullish_context ? close + atr_val * atr_tp_mult * 3.0 : close - atr_val * atr_tp_mult * 3.0
 rr_ratio = atr_tp_mult / atr_sl_mult
 
-// 绘制止损/止盈线
-if barstate.islast
-    line.new(bar_index, sl_price, bar_index + 20, sl_price, color=color.red, width=2, style=line.style_dashed)
-    line.new(bar_index, tp1_price, bar_index + 20, tp1_price, color=color.green, width=1, style=line.style_dashed)
-    line.new(bar_index, tp2_price, bar_index + 20, tp2_price, color=color.lime, width=1, style=line.style_dashed)
-    label.new(bar_index + 22, sl_price, "SL: " + str.tostring(sl_price, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-    label.new(bar_index + 22, tp1_price, "T1: " + str.tostring(tp1_price, "#.##"), color=color.green, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-    label.new(bar_index + 22, tp2_price, "T2: " + str.tostring(tp2_price, "#.##"), color=color.lime, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+// [更新] 只创建一次线/标签，然后在最后一根K线更新。
+var line sl_line = na
+var line tp1_line = na
+var line tp2_line = na
+var line tp3_line = na
+
+var label sl_label = na
+var label tp1_label = na
+var label tp2_label = na
+var label tp3_label = na
+
+if barstate.islast and show_risk_lines
+    if na(sl_line)
+        sl_line := line.new(bar_index, sl_price, bar_index + 20, sl_price, color=color.red, width=2, style=line.style_dashed)
+        tp1_line := line.new(bar_index, tp1_price, bar_index + 20, tp1_price, color=color.green, width=1, style=line.style_dashed)
+        tp2_line := line.new(bar_index, tp2_price, bar_index + 20, tp2_price, color=color.lime, width=1, style=line.style_dashed)
+        tp3_line := line.new(bar_index, tp3_price, bar_index + 20, tp3_price, color=color.aqua, width=1, style=line.style_dashed)
+
+        sl_label := label.new(bar_index + 22, sl_price, "", color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        tp1_label := label.new(bar_index + 22, tp1_price, "", color=color.green, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        tp2_label := label.new(bar_index + 22, tp2_price, "", color=color.lime, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        tp3_label := label.new(bar_index + 22, tp3_price, "", color=color.aqua, textcolor=color.black, style=label.style_label_left, size=size.tiny)
+
+    line.set_xy1(sl_line, bar_index, sl_price)
+    line.set_xy2(sl_line, bar_index + 20, sl_price)
+    line.set_xy1(tp1_line, bar_index, tp1_price)
+    line.set_xy2(tp1_line, bar_index + 20, tp1_price)
+    line.set_xy1(tp2_line, bar_index, tp2_price)
+    line.set_xy2(tp2_line, bar_index + 20, tp2_price)
+    line.set_xy1(tp3_line, bar_index, tp3_price)
+    line.set_xy2(tp3_line, bar_index + 20, tp3_price)
+
+    label.set_xy(sl_label, bar_index + 22, sl_price)
+    label.set_text(sl_label, "SL: " + str.tostring(sl_price, "#.##"))
+    label.set_xy(tp1_label, bar_index + 22, tp1_price)
+    label.set_text(tp1_label, "T1: " + str.tostring(tp1_price, "#.##"))
+    label.set_xy(tp2_label, bar_index + 22, tp2_price)
+    label.set_text(tp2_label, "T2: " + str.tostring(tp2_price, "#.##"))
+    label.set_xy(tp3_label, bar_index + 22, tp3_price)
+    label.set_text(tp3_label, "T3: " + str.tostring(tp3_price, "#.##"))
 
 
-// ==================== 15. 超级信息面板 (Table) ====================
-var table panel = table.new(position=position.bottom_left, columns=2, rows=18, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 50))
+// ============================================================================
+// 13. 主信息面板
+// ============================================================================
 
-if barstate.islast
-    table.cell(panel, 0, 0, "AI策略师 Pro", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
+var table panel = table.new(position=position.bottom_left, columns=2, rows=20, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 50))
+
+if barstate.islast and show_panel
+    table.cell(panel, 0, 0, "策略面板 Pro v2", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
     table.cell(panel, 1, 0, "实时分析", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
 
     score_display = bull_score > bear_score ? str.tostring(bull_score) + "/10 做多" : str.tostring(bear_score) + "/10 做空"
@@ -311,88 +467,119 @@ if barstate.islast
     table.cell(panel, 0, 1, "信号评分", text_color=color.white, text_size=size.small)
     table.cell(panel, 1, 1, score_display, text_color=score_color, text_size=size.small)
 
-    struct_text = struct_dir == 1 ? "上升结构" : "下降结构"
-    struct_color2 = struct_dir == 1 ? color.green : color.red
+    struct_text = struct_dir == 1 ? "上升结构" : struct_dir == -1 ? "下降结构" : "未确认"
+    struct_color = struct_dir == 1 ? color.green : struct_dir == -1 ? color.red : color.gray
     table.cell(panel, 0, 2, "市场结构", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 2, struct_text, text_color=struct_color2, text_size=size.small)
+    table.cell(panel, 1, 2, struct_text, text_color=struct_color, text_size=size.small)
 
-    table.cell(panel, 0, 3, "入场位", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 3, str.tostring(entry_price, "#.##"), text_color=#00FFFF, text_size=size.small)
-    table.cell(panel, 0, 4, "止损位 (ATR)", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 4, str.tostring(sl_price, "#.##"), text_color=color.red, text_size=size.small)
-    table.cell(panel, 0, 5, "目标1 (T1)", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 5, str.tostring(tp1_price, "#.##"), text_color=color.green, text_size=size.small)
-    table.cell(panel, 0, 6, "目标2 (T2)", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 6, str.tostring(tp2_price, "#.##"), text_color=color.green, text_size=size.small)
-    table.cell(panel, 0, 7, "目标3 (T3)", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 7, str.tostring(tp3_price, "#.##"), text_color=color.lime, text_size=size.small)
-    table.cell(panel, 0, 8, "风险回报比", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 8, "1:" + str.tostring(rr_ratio, "#.##"), text_color=rr_ratio >= 2 ? color.green : color.orange, text_size=size.small)
+    cloud_text = price_above_cloud ? "云上" : price_below_cloud ? "云下" : in_the_cloud ? "云中" : "无数据"
+    cloud_color = price_above_cloud ? color.green : price_below_cloud ? color.red : color.yellow
+    table.cell(panel, 0, 3, "一目位置", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 3, cloud_text, text_color=cloud_color, text_size=size.small)
 
-    table.cell(panel, 0, 9, "日线趋势(D)", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 9, d_trend, text_color=d_bull ? color.green : color.red, text_size=size.small)
-    table.cell(panel, 0, 10, "周线趋势(W)", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 10, w_trend, text_color=w_bull ? color.green : color.red, text_size=size.small)
-    table.cell(panel, 0, 11, "月线趋势(M)", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 11, m_trend, text_color=m_bull ? color.green : color.red, text_size=size.small)
+    table.cell(panel, 0, 4, "入场参考", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 4, str.tostring(entry_price, "#.##"), text_color=#00FFFF, text_size=size.small)
 
-    align_text = all_bull_aligned ? "全面做多" : (all_bear_aligned ? "全面做空" : "分歧")
-    align_color = all_bull_aligned ? color.green : (all_bear_aligned ? color.red : color.yellow)
-    table.cell(panel, 0, 12, "多周期对齐", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 12, align_text, text_color=align_color, text_size=size.small)
+    table.cell(panel, 0, 5, "止损位 ATR", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 5, str.tostring(sl_price, "#.##"), text_color=color.red, text_size=size.small)
 
-    rsi_status = rsi_val > rsi_ob ? "超买" : (rsi_val < rsi_os ? "超卖" : "中性")
-    rsi_color = rsi_val > rsi_ob ? color.red : (rsi_val < rsi_os ? color.green : color.gray)
-    table.cell(panel, 0, 13, "RSI(" + str.tostring(rsi_len) + ")", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 13, str.tostring(rsi_val, "#.#") + " " + rsi_status, text_color=rsi_color, text_size=size.small)
+    table.cell(panel, 0, 6, "目标1 T1", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 6, str.tostring(tp1_price, "#.##"), text_color=color.green, text_size=size.small)
 
-    macd_status = macd_line > signal_line ? "金叉" : "死叉"
-    macd_color = macd_line > signal_line ? color.green : color.red
-    table.cell(panel, 0, 14, "MACD", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 14, macd_status, text_color=macd_color, text_size=size.small)
+    table.cell(panel, 0, 7, "目标2 T2", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 7, str.tostring(tp2_price, "#.##"), text_color=color.green, text_size=size.small)
+
+    table.cell(panel, 0, 8, "目标3 T3", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 8, str.tostring(tp3_price, "#.##"), text_color=color.lime, text_size=size.small)
+
+    table.cell(panel, 0, 9, "风险回报比", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 9, "1:" + str.tostring(rr_ratio, "#.##"), text_color=rr_ratio >= 2 ? color.green : color.orange, text_size=size.small)
+
+    table.cell(panel, 0, 10, "日线趋势 D", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 10, d_trend, text_color=d_bull ? color.green : color.red, text_size=size.small)
+
+    table.cell(panel, 0, 11, "周线趋势 W", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 11, w_trend, text_color=w_bull ? color.green : color.red, text_size=size.small)
+
+    table.cell(panel, 0, 12, "月线趋势 M", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 12, m_trend, text_color=m_bull ? color.green : color.red, text_size=size.small)
+
+    align_text = all_bull_aligned ? "全面做多" : all_bear_aligned ? "全面做空" : "分歧"
+    align_color = all_bull_aligned ? color.green : all_bear_aligned ? color.red : color.yellow
+    table.cell(panel, 0, 13, "多周期对齐", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 13, align_text, text_color=align_color, text_size=size.small)
+
+    rsi_status = rsi_val > rsi_ob ? "超买" : rsi_val < rsi_os ? "超卖" : rsi_val > 50 ? "偏强" : "偏弱"
+    rsi_color = rsi_val > rsi_ob ? color.red : rsi_val < rsi_os ? color.green : rsi_val > 50 ? color.green : color.orange
+    table.cell(panel, 0, 14, "RSI(" + str.tostring(rsi_len) + ")", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 14, str.tostring(rsi_val, "#.#") + " " + rsi_status, text_color=rsi_color, text_size=size.small)
+
+    macd_status = macd_bull ? "金叉" : "死叉"
+    macd_color = macd_bull ? color.green : color.red
+    table.cell(panel, 0, 15, "MACD", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 15, macd_status, text_color=macd_color, text_size=size.small)
 
     adx_text = adx_val > 25 ? "强趋势 " + str.tostring(adx_val, "#.#") : "弱趋势 " + str.tostring(adx_val, "#.#")
-    table.cell(panel, 0, 15, "ADX 趋势力", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 15, adx_text, text_color=adx_val > 25 ? color.green : color.gray, text_size=size.small)
+    table.cell(panel, 0, 16, "ADX 趋势力", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 16, adx_text, text_color=adx_val > 25 ? color.green : color.gray, text_size=size.small)
 
-    sq_text = is_squeeze ? "挤压中-即将爆发" : "正常波动"
-    table.cell(panel, 0, 16, "Squeeze", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 16, sq_text, text_color=is_squeeze ? color.yellow : color.gray, text_size=size.small)
+    sq_text = is_squeeze ? "挤压中" : "正常波动"
+    table.cell(panel, 0, 17, "Squeeze", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 17, sq_text, text_color=is_squeeze ? color.yellow : color.gray, text_size=size.small)
 
-    vol_status = volume > vol_ma20 * 2.0 ? "巨量" : (volume > vol_ma20 * 1.5 ? "放量" : (volume < vol_ma20 * 0.5 ? "极度缩量" : "正常"))
-    vol_color = volume > vol_ma20 * 1.5 ? color.orange : color.gray
-    table.cell(panel, 0, 17, "成交量", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 17, vol_status, text_color=vol_color, text_size=size.small)
+    vol_status = volume > vol_ma20 * 2.0 ? "巨量" : volume > vol_ma20 * 1.5 ? "放量" : volume < vol_ma20 * 0.5 ? "极度缩量" : "正常"
+    vol_color = volume > vol_ma20 * 1.5 ? color.orange : volume < vol_ma20 * 0.5 ? color.gray : color.white
+    table.cell(panel, 0, 18, "成交量", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 18, vol_status, text_color=vol_color, text_size=size.small)
+
+    vwap_text = use_vwap ? (vwap_bias == 1 ? "VWAP上方" : vwap_bias == -1 ? "VWAP下方" : "VWAP附近") : "非日内不启用"
+    vwap_color = use_vwap ? (vwap_bias == 1 ? color.green : vwap_bias == -1 ? color.red : color.gray) : color.gray
+    table.cell(panel, 0, 19, "VWAP状态", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 19, vwap_text, text_color=vwap_color, text_size=size.small)
 
 
-// ==================== 15B. 看图顺序提示面板 ====================
+// ============================================================================
+// 14. 看图顺序提示面板
+// ============================================================================
+
 var table guide_panel = table.new(position=position.bottom_right, columns=1, rows=12, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
 
 if barstate.islast and show_guide
     table.cell(guide_panel, 0, 0, "看图顺序提示", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
-    table.cell(guide_panel, 0, 1, "1. 先看月/周/日趋势", text_color=color.white, text_size=size.tiny)
+    table.cell(guide_panel, 0, 1, "1. 先看日/周/月趋势", text_color=color.white, text_size=size.tiny)
     table.cell(guide_panel, 0, 2, "2. 看多周期是否对齐", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 3, "3. 看价格相对MA50/MA200", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 4, "4. 看价格在云层上/中/下", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 5, "5. 看信号评分偏多或偏空", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 6, "6. 看BOS与市场结构", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 7, "7. 看MACD/RSI/ADX动能", text_color=color.white, text_size=size.tiny)
+    table.cell(guide_panel, 0, 3, "3. 看价格相对一目均衡表云层", text_color=color.white, text_size=size.tiny)
+    table.cell(guide_panel, 0, 4, "4. 看价格在云上/云中/云下", text_color=color.white, text_size=size.tiny)
+    table.cell(guide_panel, 0, 5, "5. 看评分与结构方向", text_color=color.white, text_size=size.tiny)
+    table.cell(guide_panel, 0, 6, "6. 看BOS / OB / FVG", text_color=color.white, text_size=size.tiny)
+    table.cell(guide_panel, 0, 7, "7. 看MACD / RSI / ADX", text_color=color.white, text_size=size.tiny)
     table.cell(guide_panel, 0, 8, "8. 看Squeeze与成交量", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 9, "9. 等回踩OB/FVG再进场", text_color=color.white, text_size=size.tiny)
+    table.cell(guide_panel, 0, 9, "9. 等回踩确认再进场", text_color=color.white, text_size=size.tiny)
     table.cell(guide_panel, 0, 10, "10. 不逆大周期重仓", text_color=color.orange, text_size=size.tiny)
-    table.cell(guide_panel, 0, 11, "原则: 方向>结构>回踩>信号>风控", text_color=color.aqua, text_size=size.tiny)
+    table.cell(guide_panel, 0, 11, "原则: 方向 > 结构 > 位置 > 信号 > 风控", text_color=color.aqua, text_size=size.tiny)
 
-// ==================== 16. 警报条件 ====================
-alertcondition(signal_bull and not signal_bull[1], title="BUY信号(趋势+回踩)", message="AI策略师: 趋势内回踩确认做多!")
-alertcondition(signal_bear and not signal_bear[1], title="SELL信号(趋势+回踩)", message="AI策略师: 趋势内回踩确认做空!")
-alertcondition(bear_div, title="熊背离", message="AI策略师: 检测到熊背离, 注意风险!")
-alertcondition(bull_div, title="牛背离", message="AI策略师: 检测到牛背离, 关注反弹机会!")
-alertcondition(is_squeeze and not is_squeeze[1], title="进入挤压", message="AI策略师: 布林带挤压开始, 准备大行情!")
-alertcondition(bos_bullish, title="多头结构突破", message="AI策略师: 多头结构突破 (BOS)!")
-alertcondition(bos_bearish, title="空头结构突破", message="AI策略师: 空头结构突破 (BOS)!")
-alertcondition(all_bull_aligned and not all_bull_aligned[1], title="多周期做多对齐", message="AI策略师: 日/周/月线全面多头对齐!")
-alertcondition(all_bear_aligned and not all_bear_aligned[1], title="多周期做空对齐", message="AI策略师: 日/周/月线全面空头对齐!")
-alertcondition(bull_fvg, title="看涨FVG出现", message="AI策略师: 出现看涨FVG, 等待回踩!")
-alertcondition(bear_fvg, title="看跌FVG出现", message="AI策略师: 出现看跌FVG, 等待回踩!")
 
-// ==================== END ====================
+// ============================================================================
+// 15. 警报条件
+// ============================================================================
+
+alertcondition(signal_bull and not signal_bull[1], title="BUY信号(趋势+回踩)", message="策略面板 Pro v2: 趋势内回踩确认做多")
+alertcondition(signal_bear and not signal_bear[1], title="SELL信号(趋势+回踩)", message="策略面板 Pro v2: 趋势内回踩确认做空")
+
+alertcondition(bear_div_confirmed, title="确认熊背离", message="策略面板 Pro v2: 检测到确认熊背离，注意风险")
+alertcondition(bull_div_confirmed, title="确认牛背离", message="策略面板 Pro v2: 检测到确认牛背离，关注反弹")
+
+alertcondition(is_squeeze and not is_squeeze[1], title="进入挤压", message="策略面板 Pro v2: 布林带挤压开始，准备方向选择")
+
+alertcondition(bos_bullish, title="多头结构突破", message="策略面板 Pro v2: 多头结构突破 BOS")
+alertcondition(bos_bearish, title="空头结构突破", message="策略面板 Pro v2: 空头结构突破 BOS")
+
+alertcondition(all_bull_aligned and not all_bull_aligned[1], title="多周期做多对齐", message="策略面板 Pro v2: 日/周/月多头对齐")
+alertcondition(all_bear_aligned and not all_bear_aligned[1], title="多周期做空对齐", message="策略面板 Pro v2: 日/周/月空头对齐")
+
+alertcondition(bull_fvg, title="看涨FVG出现", message="策略面板 Pro v2: 出现看涨FVG，等待回踩")
+alertcondition(bear_fvg, title="看跌FVG出现", message="策略面板 Pro v2: 出现看跌FVG，等待回踩")
+
+// ============================================================================
+// END
+// ============================================================================
