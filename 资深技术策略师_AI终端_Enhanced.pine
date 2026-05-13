@@ -1,19 +1,17 @@
-//@version=5
-indicator("多周期技术策略面板 Pro v2.0", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+//@version=6
+indicator(
+     "多周期交易决策面板 Pro v4.6 V6 多头状态机+做T辅助版",
+     overlay=true,
+     max_boxes_count=320,
+     max_lines_count=140,
+     max_labels_count=160
+)
 
 // ============================================================================
-// v2.0 更新说明
+// v4.6 V6 多头状态机 + 支撑压力质量评分 + 做T辅助版
 // ----------------------------------------------------------------------------
-// [更新 1] 修复 ATR 止损/止盈线与标签重复创建问题：改为 var 对象 + line.set / label.set 实时更新。
-// [更新 2] 修正 Ichimoku 云层逻辑：交易判断使用 senkouA[displacement] / senkouB[displacement]，与当前图上云层对齐。
-// [更新 3] 修正 in_the_cloud 判断：兼容多头云与空头云。
-// [更新 4] VWAP 改为 ta.vwap(hlc3)，且仅在日内周期参与评分。
-// [更新 5] RSI 评分拆分为多空方向，不再给多空双方同时加中性分。
-// [更新 6] 背离改为 Pivot Confirmed Divergence，减少误报。
-// [更新 7] FVG / OB 使用数组控制数量，避免图表对象过多。
-// [更新 8] 多周期趋势优化：日 MA50、周 MA20、月 MA10，更适合波段交易。
-// [更新 9] 增加显示模式：简洁 / 趋势 / SMC / 完整，降低视觉噪音。
-// [更新 10] 将“自动化交易设置”更名为“ATR 风险参考线”，避免误解。
+// 适用：A股、港股通、普通多头账户。
+// 说明：这是 indicator，不是 strategy；用于交易决策辅助，不做真实回测。
 // ============================================================================
 
 
@@ -25,9 +23,14 @@ grp_display = "显示设置"
 display_mode = input.string("完整", "显示模式", options=["简洁", "趋势", "SMC", "完整"], group=grp_display)
 show_panel = input.bool(true, "显示主信息面板", group=grp_display)
 show_guide = input.bool(true, "显示看图顺序提示", group=grp_display)
-show_risk_lines = input.bool(true, "显示ATR止盈止损参考线", group=grp_display)
+show_trade_plan_lines = input.bool(true, "显示交易计划线", group=grp_display)
 show_patterns = input.bool(true, "显示K线形态", group=grp_display)
 show_divergence = input.bool(true, "显示RSI背离", group=grp_display)
+show_watch_labels = input.bool(false, "显示WATCH观察标签", group=grp_display)
+show_setup_labels = input.bool(true, "显示SETUP标签", group=grp_display)
+show_trade_labels = input.bool(true, "显示LONG/ADD标签", group=grp_display)
+show_reduce_labels = input.bool(true, "显示减仓/风控标签", group=grp_display)
+hide_last_n = input.int(0, "隐藏最新N根K线用于验证", minval=0, maxval=500, group=grp_display)
 
 is_simple_mode = display_mode == "简洁"
 is_trend_mode  = display_mode == "趋势"
@@ -37,6 +40,30 @@ is_full_mode   = display_mode == "完整"
 show_trend_tools = is_trend_mode or is_full_mode or is_simple_mode
 show_smc_tools   = is_smc_mode or is_full_mode
 
+visible_last_bar = last_bar_index - hide_last_n
+is_visible_bar = bar_index <= visible_last_bar
+is_panel_bar = bar_index == visible_last_bar
+
+
+grp_mode = "实战模式"
+signal_mode = input.string("均衡", "信号灵敏度", options=["保守", "均衡", "进攻"], group=grp_mode)
+allow_countertrend_watch = input.bool(true, "允许左侧观察点", group=grp_mode)
+allow_early_setup = input.bool(true, "允许早期SETUP", group=grp_mode)
+use_state_machine = input.bool(true, "启用虚拟持仓状态机", group=grp_mode)
+
+is_conservative = signal_mode == "保守"
+is_aggressive = signal_mode == "进攻"
+
+
+grp_state = "状态机 / 标签密度"
+long_cooldown = input.int(10, "LONG初买冷却K数", minval=1, maxval=100, group=grp_state)
+add_cooldown = input.int(8, "ADD加仓冷却K数", minval=1, maxval=100, group=grp_state)
+setup_cooldown = input.int(6, "SETUP冷却K数", minval=1, maxval=100, group=grp_state)
+reduce_cooldown = input.int(6, "减仓冷却K数", minval=1, maxval=100, group=grp_state)
+risk_cooldown = input.int(5, "风控冷却K数", minval=1, maxval=100, group=grp_state)
+reset_after_risk_off = input.int(5, "风险退出后重置等待K数", minval=1, maxval=50, group=grp_state)
+
+
 grp_ma = "移动平均线设置"
 ma_fast_len   = input.int(20, "快速MA周期", minval=5, group=grp_ma)
 ma_mid_len    = input.int(50, "中速MA周期", minval=10, group=grp_ma)
@@ -44,45 +71,141 @@ ma_slow_len   = input.int(100, "慢速MA周期", minval=20, group=grp_ma)
 ma_ultra_len  = input.int(200, "超慢MA周期", minval=50, group=grp_ma)
 show_ema_ribbon = input.bool(true, "显示EMA Ribbon", group=grp_ma)
 
-grp_bb = "布林带设置"
+
+grp_bb = "布林带 / 波动率"
 show_bb   = input.bool(true, "显示布林带", group=grp_bb)
 bb_len    = input.int(20, "BB周期", minval=5, group=grp_bb)
 bb_mult   = input.float(2.0, "BB标准差倍数", minval=0.5, step=0.1, group=grp_bb)
+min_atr_pct_base = input.float(0.25, "最低ATR%过滤基准", minval=0.01, step=0.05, group=grp_bb)
 
-grp_rsi = "RSI设置"
+
+grp_sr = "20K最强支撑/压力"
+enable_sr_cluster = input.bool(true, "启用最近N根K线支撑/压力聚类", group=grp_sr)
+sr_len = input.int(20, "支撑/压力统计K线数量", minval=5, maxval=100, group=grp_sr)
+sr_cluster_atr = input.float(0.35, "价格簇容差 ATR倍数", minval=0.05, step=0.05, group=grp_sr)
+sr_zone_atr = input.float(0.35, "支撑/压力区宽度 ATR倍数", minval=0.05, step=0.05, group=grp_sr)
+sr_min_touches = input.int(2, "最少有效触碰次数", minval=1, maxval=10, group=grp_sr)
+show_sr_zone = input.bool(true, "显示最强支撑/压力区", group=grp_sr)
+sr_line_extend = input.int(30, "支撑/压力线向右延伸K数", minval=5, maxval=100, group=grp_sr)
+
+
+grp_sr2 = "支撑压力质量增强"
+enable_sr_quality = input.bool(true, "启用支撑/压力质量评分", group=grp_sr2)
+sr_reaction_bars = input.int(3, "触碰后反应统计K数", minval=1, maxval=10, group=grp_sr2)
+sr_reaction_atr = input.float(0.60, "有效反应ATR倍数", minval=0.1, step=0.1, group=grp_sr2)
+enable_sr_role_flip = input.bool(true, "启用支撑压力角色转换", group=grp_sr2)
+enable_sr_multi_window = input.bool(true, "启用20K/60K共振", group=grp_sr2)
+sr_mid_len = input.int(60, "中期支撑压力统计K数", minval=30, maxval=200, group=grp_sr2)
+
+
+grp_t = "持仓 / 做T辅助"
+enable_t_plan = input.bool(true, "启用做T辅助", group=grp_t)
+user_cost = input.float(0.0, "实际持仓成本价", minval=0.0, step=0.01, group=grp_t)
+user_qty = input.int(0, "实际持仓数量", minval=0, group=grp_t)
+t_qty = input.int(0, "计划做T数量，0=全部持仓", minval=0, group=grp_t)
+t_min_profit_pct = input.float(0.80, "最低做T空间%", minval=0.1, step=0.1, group=grp_t)
+t_commission_rate = input.float(0.03, "单边佣金费率%", minval=0.0, step=0.01, group=grp_t)
+t_sell_tax_rate = input.float(0.05, "卖出税费/印花税率%", minval=0.0, step=0.01, group=grp_t)
+t_sell_atr_buffer = input.float(0.20, "高抛目标缓冲ATR", minval=0.0, step=0.05, group=grp_t)
+t_buy_atr_buffer = input.float(0.20, "低吸目标缓冲ATR", minval=0.0, step=0.05, group=grp_t)
+show_t_lines = input.bool(true, "显示做T计划线", group=grp_t)
+
+
+grp_rsi = "RSI / 背离"
 rsi_len   = input.int(14, "RSI周期", minval=5, group=grp_rsi)
 rsi_ob    = input.int(70, "超买阈值", minval=60, group=grp_rsi)
 rsi_os    = input.int(30, "超卖阈值", maxval=40, group=grp_rsi)
 div_left  = input.int(5, "背离Pivot左侧", minval=2, group=grp_rsi)
 div_right = input.int(5, "背离Pivot右侧", minval=2, group=grp_rsi)
 
-grp_ichi = "一目均衡设置"
+
+grp_ichi = "一目均衡"
 show_ichimoku = input.bool(true, "显示一目均衡云", group=grp_ichi)
 ichi_tenkan   = input.int(9, "转换线周期", minval=1, group=grp_ichi)
 ichi_kijun    = input.int(26, "基准线/位移周期", minval=1, group=grp_ichi)
 ichi_senkou   = input.int(52, "先行带B周期", minval=1, group=grp_ichi)
 
+
 grp_smc = "Smart Money Concepts"
-show_market_structure = input.bool(true, "显示市场结构 BOS", group=grp_smc)
+show_market_structure = input.bool(true, "显示市场结构 BOS / CHoCH", group=grp_smc)
 show_ob       = input.bool(true, "显示订单块 OB", group=grp_smc)
 show_fvg      = input.bool(true, "显示FVG", group=grp_smc)
 swing_len     = input.int(5, "结构Swing周期", minval=2, group=grp_smc)
+ob_lookback   = input.int(12, "BOS前寻找OB的K线数量", minval=3, maxval=50, group=grp_smc)
 max_ob_boxes  = input.int(20, "最多显示OB数量", minval=1, maxval=100, group=grp_smc)
 max_fvg_boxes = input.int(30, "最多显示FVG数量", minval=1, maxval=150, group=grp_smc)
+min_fvg_atr_base = input.float(0.20, "FVG最小ATR倍数基准", minval=0.0, step=0.05, group=grp_smc)
+
+
+grp_filter = "实战过滤器"
+adx_len = input.int(14, "ADX周期", minval=5, group=grp_filter)
+min_adx_base = input.float(20.0, "最低ADX趋势强度基准", minval=5, step=0.5, group=grp_filter)
+vol_len = input.int(20, "成交量均线周期", minval=5, group=grp_filter)
+vol_mult_break_base = input.float(1.25, "突破放量倍数基准", minval=0.5, step=0.05, group=grp_filter)
+bos_atr_buffer_base = input.float(0.10, "BOS突破ATR缓冲基准", minval=0.0, step=0.05, group=grp_filter)
+max_chase_atr = input.float(1.20, "最大追价距离ATR倍数", minval=0.2, step=0.1, group=grp_filter)
+no_chase_atr = input.float(2.30, "禁止追高ATR倍数", minval=1.0, step=0.1, group=grp_filter)
+sweep_len = input.int(10, "流动性扫盘回看K数", minval=3, maxval=50, group=grp_filter)
+extension_atr = input.float(2.6, "高位延伸ATR倍数", minval=1.0, step=0.1, group=grp_filter)
+
+
+grp_risk = "减仓 / 风控"
+reduce_on_sweep_high = input.bool(true, "扫高回落提示减仓", group=grp_risk)
+reduce_on_bear_div = input.bool(true, "熊背离提示减仓", group=grp_risk)
+reduce_on_upper_band = input.bool(true, "上轨拒绝提示减仓", group=grp_risk)
+risk_off_on_ma20_lost = input.bool(true, "跌破MA20提示风控", group=grp_risk)
+risk_off_on_ma50_lost = input.bool(true, "跌破MA50提示风险退出", group=grp_risk)
+risk_off_volume_mult = input.float(1.20, "风控放量倍数", minval=0.5, step=0.05, group=grp_risk)
+
 
 grp_signal = "信号系统"
 show_signals  = input.bool(true, "显示交易信号", group=grp_signal)
-min_score     = input.int(7, "最低信号分数 (1-10)", minval=1, maxval=10, group=grp_signal)
-confirm_on_close = input.bool(true, "仅收盘确认信号", group=grp_signal)
+min_dir_score_base = input.int(7, "最低方向评分基准 1-10", minval=1, maxval=10, group=grp_signal)
+min_entry_quality_base = input.int(3, "最低入场质量基准 1-5", minval=1, maxval=5, group=grp_signal)
+min_rr_base = input.float(1.5, "最低盈亏比基准", minval=0.5, step=0.1, group=grp_signal)
+confirm_on_close = input.bool(true, "仅收盘确认正式信号", group=grp_signal)
+enable_intrabar_warning = input.bool(true, "启用盘中预警", group=grp_signal)
+
+
+grp_mtf = "多周期设置"
+use_confirmed_htf = input.bool(true, "高周期使用上一根已收盘数据", group=grp_mtf)
+tf_d = input.timeframe("D", "日线周期", group=grp_mtf)
+tf_w = input.timeframe("W", "周线周期", group=grp_mtf)
+tf_m = input.timeframe("M", "月线周期", group=grp_mtf)
+
 
 grp_atr = "ATR & 风控"
 atr_len       = input.int(14, "ATR周期", group=grp_atr)
 atr_sl_mult   = input.float(2.0, "止损ATR倍数", step=0.1, group=grp_atr)
-atr_tp_mult   = input.float(3.0, "止盈ATR倍数", step=0.1, group=grp_atr)
+rr_t1_mult    = input.float(2.0, "目标1 R倍数", step=0.1, group=grp_atr)
+rr_t2_mult    = input.float(3.0, "目标2 R倍数", step=0.1, group=grp_atr)
 
 
 // ============================================================================
-// 1. 基础指标：MA / EMA Ribbon
+// 1. 动态阈值
+// ============================================================================
+
+mode_dir_adj = is_conservative ? 1 : is_aggressive ? -2 : -1
+mode_quality_adj = is_conservative ? 0 : is_aggressive ? -1 : 0
+mode_adx_mult = is_conservative ? 1.10 : is_aggressive ? 0.75 : 0.90
+mode_vol_mult = is_conservative ? 1.10 : is_aggressive ? 0.80 : 0.90
+mode_rr_mult = is_conservative ? 1.10 : is_aggressive ? 0.75 : 0.90
+mode_atr_pct_mult = is_conservative ? 1.00 : is_aggressive ? 0.60 : 0.75
+mode_fvg_mult = is_conservative ? 1.00 : is_aggressive ? 0.50 : 0.75
+mode_bos_mult = is_conservative ? 1.00 : is_aggressive ? 0.50 : 0.75
+
+min_dir_score = math.max(1, math.min(10, min_dir_score_base + mode_dir_adj))
+min_entry_quality = math.max(1, math.min(5, min_entry_quality_base + mode_quality_adj))
+min_adx = min_adx_base * mode_adx_mult
+vol_mult_break = vol_mult_break_base * mode_vol_mult
+min_rr = min_rr_base * mode_rr_mult
+min_atr_pct = min_atr_pct_base * mode_atr_pct_mult
+min_fvg_atr = min_fvg_atr_base * mode_fvg_mult
+bos_atr_buffer = bos_atr_buffer_base * mode_bos_mult
+
+
+// ============================================================================
+// 2. 基础指标
 // ============================================================================
 
 ma20  = ta.sma(close, ma_fast_len)
@@ -90,24 +213,41 @@ ma50  = ta.sma(close, ma_mid_len)
 ma100 = ta.sma(close, ma_slow_len)
 ma200 = ta.sma(close, ma_ultra_len)
 
-ema8   = ta.ema(close, 8)
-ema13  = ta.ema(close, 13)
-ema21  = ta.ema(close, 21)
-ema34  = ta.ema(close, 34)
-ema55  = ta.ema(close, 55)
+ema8  = ta.ema(close, 8)
+ema13 = ta.ema(close, 13)
+ema21 = ta.ema(close, 21)
+ema55 = ta.ema(close, 55)
 
-plot(show_trend_tools ? ma20 : na,  color=color.orange, title="MA20",  linewidth=1)
-plot(show_trend_tools ? ma50 : na,  color=color.blue,   title="MA50",  linewidth=1)
-plot(show_trend_tools and not is_simple_mode ? ma100 : na, color=color.purple, title="MA100", linewidth=1)
-plot(show_trend_tools ? ma200 : na, color=color.red,    title="MA200", linewidth=2)
+atr_val = ta.atr(atr_len)
+atr_pct = atr_val / close * 100.0
+atr_ok = atr_pct >= min_atr_pct
 
-p_ema8  = plot(show_trend_tools and show_ema_ribbon and not is_simple_mode ? ema8 : na,  color=color.new(color.teal, 70), title="EMA8")
-p_ema55 = plot(show_trend_tools and show_ema_ribbon and not is_simple_mode ? ema55 : na, color=color.new(color.teal, 70), title="EMA55")
+ma20_slope_up = ma20 > ma20[1]
+ma50_slope_up = ma50 > ma50[1]
+ma20_slope_dn = ma20 < ma20[1]
+ma50_slope_dn = ma50 < ma50[1]
+
+price_above_ma20 = close > ma20
+price_below_ma20 = close < ma20
+price_above_ma50 = close > ma50
+price_below_ma50 = close < ma50
+
+ma20_reclaim = close > ma20 and close[1] <= ma20[1]
+ma20_lost = close < ma20 and close[1] >= ma20[1]
+ma50_lost = close < ma50 and close[1] >= ma50[1]
+
+plot(is_visible_bar and show_trend_tools ? ma20 : na,  color=color.orange, title="MA20", linewidth=1)
+plot(is_visible_bar and show_trend_tools ? ma50 : na,  color=color.blue, title="MA50", linewidth=1)
+plot(is_visible_bar and show_trend_tools and not is_simple_mode ? ma100 : na, color=color.purple, title="MA100", linewidth=1)
+plot(is_visible_bar and show_trend_tools ? ma200 : na, color=color.red, title="MA200", linewidth=2)
+
+p_ema8  = plot(is_visible_bar and show_trend_tools and show_ema_ribbon and not is_simple_mode ? ema8 : na, color=color.new(color.teal, 72), title="EMA8")
+p_ema55 = plot(is_visible_bar and show_trend_tools and show_ema_ribbon and not is_simple_mode ? ema55 : na, color=color.new(color.teal, 72), title="EMA55")
 fill(p_ema8, p_ema55, color=ema8 > ema55 ? color.new(color.green, 86) : color.new(color.red, 86), title="EMA Ribbon")
 
 
 // ============================================================================
-// 2. 布林带 + Squeeze
+// 3. 布林带 / VWAP
 // ============================================================================
 
 bb_basis = ta.sma(close, bb_len)
@@ -115,29 +255,26 @@ bb_dev   = bb_mult * ta.stdev(close, bb_len)
 bb_upper = bb_basis + bb_dev
 bb_lower = bb_basis - bb_dev
 
-plot(show_trend_tools and show_bb and not is_simple_mode ? bb_upper : na, color=color.new(color.gray, 50), title="BB Upper")
-plot(show_trend_tools and show_bb and not is_simple_mode ? bb_basis : na, color=color.new(color.gray, 70), title="BB Basis")
-plot(show_trend_tools and show_bb and not is_simple_mode ? bb_lower : na, color=color.new(color.gray, 50), title="BB Lower")
+plot(is_visible_bar and show_trend_tools and show_bb and not is_simple_mode ? bb_upper : na, color=color.new(color.gray, 50), title="BB Upper")
+plot(is_visible_bar and show_trend_tools and show_bb and not is_simple_mode ? bb_basis : na, color=color.new(color.gray, 70), title="BB Basis")
+plot(is_visible_bar and show_trend_tools and show_bb and not is_simple_mode ? bb_lower : na, color=color.new(color.gray, 50), title="BB Lower")
 
 kc_basis = ta.sma(close, 20)
 kc_range = ta.atr(10)
 kc_upper = kc_basis + kc_range * 1.5
 kc_lower = kc_basis - kc_range * 1.5
+
 is_squeeze = bb_lower > kc_lower and bb_upper < kc_upper
-
-
-// ============================================================================
-// 3. VWAP
-// ============================================================================
-// [更新] VWAP 仅在日内周期显示与参与评分；日线及更高周期不参与。
+bb_width = (bb_upper - bb_lower) / bb_basis
+bb_expand = bb_width > bb_width[1]
 
 use_vwap = timeframe.isintraday
 vwap_val = ta.vwap(hlc3)
-plot(use_vwap and show_trend_tools ? vwap_val : na, color=color.new(color.yellow, 30), title="VWAP", linewidth=2, style=plot.style_stepline)
+plot(is_visible_bar and use_vwap and show_trend_tools ? vwap_val : na, color=color.new(color.yellow, 30), title="VWAP", linewidth=2, style=plot.style_stepline)
 
 
 // ============================================================================
-// 4. Ichimoku Cloud
+// 4. 一目均衡
 // ============================================================================
 
 tenkan  = (ta.highest(high, ichi_tenkan) + ta.lowest(low, ichi_tenkan)) / 2.0
@@ -145,15 +282,13 @@ kijun   = (ta.highest(high, ichi_kijun) + ta.lowest(low, ichi_kijun)) / 2.0
 senkouA = (tenkan + kijun) / 2.0
 senkouB = (ta.highest(high, ichi_senkou) + ta.lowest(low, ichi_senkou)) / 2.0
 
-// [更新] 用于绘图的云向右位移。
-p_sa = plot(show_trend_tools and show_ichimoku ? senkouA : na, color=color.new(color.green, 70), title="Senkou A", offset=ichi_kijun)
-p_sb = plot(show_trend_tools and show_ichimoku ? senkouB : na, color=color.new(color.red, 70), title="Senkou B", offset=ichi_kijun)
+p_sa = plot(is_visible_bar and show_trend_tools and show_ichimoku ? senkouA : na, color=color.new(color.green, 70), title="Senkou A", offset=ichi_kijun)
+p_sb = plot(is_visible_bar and show_trend_tools and show_ichimoku ? senkouB : na, color=color.new(color.red, 70), title="Senkou B", offset=ichi_kijun)
 fill(p_sa, p_sb, color=senkouA > senkouB ? color.new(color.green, 90) : color.new(color.red, 90), title="Ichimoku Cloud")
 
-plot(show_trend_tools and show_ichimoku and not is_simple_mode ? tenkan : na, color=color.new(color.aqua, 10), title="Tenkan")
-plot(show_trend_tools and show_ichimoku and not is_simple_mode ? kijun : na, color=color.new(color.fuchsia, 10), title="Kijun")
+plot(is_visible_bar and show_trend_tools and show_ichimoku and not is_simple_mode ? tenkan : na, color=color.new(color.aqua, 10), title="Tenkan")
+plot(is_visible_bar and show_trend_tools and show_ichimoku and not is_simple_mode ? kijun : na, color=color.new(color.fuchsia, 10), title="Kijun")
 
-// [更新] 用于当前K线判断的云，需要回看 displacement 根，才能与图上当前云层对齐。
 senkouA_now = senkouA[ichi_kijun]
 senkouB_now = senkouB[ichi_kijun]
 
@@ -167,23 +302,13 @@ in_the_cloud      = not na(senkouA_now) and not na(senkouB_now) and close <= clo
 cloud_bullish = not na(senkouA_now) and not na(senkouB_now) and senkouA_now > senkouB_now
 cloud_bearish = not na(senkouA_now) and not na(senkouB_now) and senkouA_now < senkouB_now
 
-atr_val = ta.atr(atr_len)
-cloud_thickness = not na(senkouA_now) and not na(senkouB_now) ? math.abs(senkouA_now - senkouB_now) : na
-cloud_strong = not na(cloud_thickness) and cloud_thickness > atr_val * 0.8
-
-tk_cross_bull = tenkan > kijun
-tk_cross_bear = tenkan < kijun
-
 
 // ============================================================================
-// 5. 成交量 / ADX / RSI / MACD
+// 5. Volume / ADX / RSI / MACD
 // ============================================================================
 
-vol_ma20 = ta.sma(volume, 20)
-
-adx_len = 14
+vol_ma = ta.sma(volume, vol_len)
 [di_plus, di_minus, adx_val] = ta.dmi(adx_len, adx_len)
-strong_trend = adx_val > 25
 
 rsi_val = ta.rsi(close, rsi_len)
 [macd_line, signal_line, macd_hist] = ta.macd(close, 12, 26, 9)
@@ -193,12 +318,287 @@ macd_bear = macd_line < signal_line
 macd_hist_rising = macd_hist > macd_hist[1]
 macd_hist_falling = macd_hist < macd_hist[1]
 
+vol_expansion_bull = volume > vol_ma * vol_mult_break and close > open
+vol_expansion_bear = volume > vol_ma * vol_mult_break and close < open
+
+trend_strength_ok = adx_val >= min_adx or bb_expand
+chop_market = adx_val < min_adx and not bb_expand and not atr_ok
+
 
 // ============================================================================
-// 6. Pivot Confirmed RSI Divergence
+// 6. 支撑 / 压力价格簇 + 质量评分
 // ============================================================================
-// [更新] 旧版区间极值背离误报较多，改为 Pivot 确认背离。
-// 注意：Pivot 背离天然滞后 div_right 根K线，但可信度更高。
+
+var float[] sr_low_prices = array.new_float()
+var int[]   sr_low_counts = array.new_int()
+var float[] sr_high_prices = array.new_float()
+var int[]   sr_high_counts = array.new_int()
+
+var float[] sr_mid_low_prices = array.new_float()
+var int[]   sr_mid_low_counts = array.new_int()
+var float[] sr_mid_high_prices = array.new_float()
+var int[]   sr_mid_high_counts = array.new_int()
+
+f_add_cluster(float[] _prices, int[] _counts, float _price, float _tol) =>
+    bool matched = false
+    int sz = array.size(_prices)
+    if sz > 0
+        for j = 0 to sz - 1
+            float cp = array.get(_prices, j)
+            int cc = array.get(_counts, j)
+            if not matched and math.abs(_price - cp) <= _tol
+                float np = (cp * cc + _price) / (cc + 1)
+                array.set(_prices, j, np)
+                array.set(_counts, j, cc + 1)
+                matched := true
+    if not matched
+        array.push(_prices, _price)
+        array.push(_counts, 1)
+
+f_best_cluster(float[] _prices, int[] _counts, bool _support, float _ref, float _tol) =>
+    float best_price = na
+    int best_count = 0
+    float best_dist = 10e10
+    int sz = array.size(_prices)
+    if sz > 0
+        for j = 0 to sz - 1
+            float p = array.get(_prices, j)
+            int c = array.get(_counts, j)
+            bool valid_side = _support ? p <= _ref + _tol : p >= _ref - _tol
+            float dist = math.abs(p - _ref)
+            bool better = valid_side and (c > best_count or (c == best_count and dist < best_dist))
+            if better
+                best_price := p
+                best_count := c
+                best_dist := dist
+
+        if na(best_price)
+            for j = 0 to sz - 1
+                float p = array.get(_prices, j)
+                int c = array.get(_counts, j)
+                float dist = math.abs(p - _ref)
+                bool better = c > best_count or (c == best_count and dist < best_dist)
+                if better
+                    best_price := p
+                    best_count := c
+                    best_dist := dist
+    [best_price, best_count]
+
+f_reaction_score(bool _support, float _level, float _zone, int _len, int _reaction_bars, float _atr_need) =>
+    int score = 0
+    int checks = math.min(_len - _reaction_bars - 1, _len)
+    if not na(_level) and checks > 0
+        for i = _reaction_bars to checks
+            bool touched = _support ? low[i] <= _level + _zone and low[i] >= _level - _zone : high[i] >= _level - _zone and high[i] <= _level + _zone
+            if touched
+                float max_after = high[i]
+                float min_after = low[i]
+                for k = 0 to _reaction_bars
+                    max_after := math.max(max_after, high[i - k])
+                    min_after := math.min(min_after, low[i - k])
+                bool reacted = _support ? max_after - _level >= atr_val * _atr_need : _level - min_after >= atr_val * _atr_need
+                if reacted
+                    score += 1
+    score
+
+sr_tol = math.max(atr_val * sr_cluster_atr, syminfo.mintick * 5)
+sr_zone = math.max(atr_val * sr_zone_atr, syminfo.mintick * 5)
+
+array.clear(sr_low_prices)
+array.clear(sr_low_counts)
+array.clear(sr_high_prices)
+array.clear(sr_high_counts)
+array.clear(sr_mid_low_prices)
+array.clear(sr_mid_low_counts)
+array.clear(sr_mid_high_prices)
+array.clear(sr_mid_high_counts)
+
+if enable_sr_cluster
+    for i = 0 to sr_len - 1
+        if not na(low[i])
+            f_add_cluster(sr_low_prices, sr_low_counts, low[i], sr_tol)
+        if not na(high[i])
+            f_add_cluster(sr_high_prices, sr_high_counts, high[i], sr_tol)
+
+    if enable_sr_multi_window
+        for i = 0 to sr_mid_len - 1
+            if not na(low[i])
+                f_add_cluster(sr_mid_low_prices, sr_mid_low_counts, low[i], sr_tol)
+            if not na(high[i])
+                f_add_cluster(sr_mid_high_prices, sr_mid_high_counts, high[i], sr_tol)
+
+[sr_support_raw, sr_support_touches_raw] = f_best_cluster(sr_low_prices, sr_low_counts, true, close, sr_tol)
+[sr_resistance_raw, sr_resistance_touches_raw] = f_best_cluster(sr_high_prices, sr_high_counts, false, close, sr_tol)
+
+[sr_mid_support_raw, sr_mid_support_touches_raw] = f_best_cluster(sr_mid_low_prices, sr_mid_low_counts, true, close, sr_tol)
+[sr_mid_resistance_raw, sr_mid_resistance_touches_raw] = f_best_cluster(sr_mid_high_prices, sr_mid_high_counts, false, close, sr_tol)
+
+sr_support = enable_sr_cluster and sr_support_touches_raw >= sr_min_touches ? sr_support_raw : na
+sr_resistance = enable_sr_cluster and sr_resistance_touches_raw >= sr_min_touches ? sr_resistance_raw : na
+
+sr_mid_support = enable_sr_cluster and enable_sr_multi_window and sr_mid_support_touches_raw >= sr_min_touches ? sr_mid_support_raw : na
+sr_mid_resistance = enable_sr_cluster and enable_sr_multi_window and sr_mid_resistance_touches_raw >= sr_min_touches ? sr_mid_resistance_raw : na
+
+sr_support_touches = not na(sr_support) ? sr_support_touches_raw : 0
+sr_resistance_touches = not na(sr_resistance) ? sr_resistance_touches_raw : 0
+sr_mid_support_touches = not na(sr_mid_support) ? sr_mid_support_touches_raw : 0
+sr_mid_resistance_touches = not na(sr_mid_resistance) ? sr_mid_resistance_touches_raw : 0
+
+sr_support_top = not na(sr_support) ? sr_support + sr_zone : na
+sr_support_bot = not na(sr_support) ? sr_support - sr_zone : na
+sr_res_top = not na(sr_resistance) ? sr_resistance + sr_zone : na
+sr_res_bot = not na(sr_resistance) ? sr_resistance - sr_zone : na
+
+near_strong_support =
+     not na(sr_support) and
+     low <= sr_support_top and
+     close >= sr_support_bot
+
+near_strong_resistance =
+     not na(sr_resistance) and
+     high >= sr_res_bot and
+     close <= sr_res_top
+
+break_strong_resistance =
+     not na(sr_resistance) and
+     close > sr_res_top and
+     close[1] <= sr_res_top
+
+break_strong_support =
+     not na(sr_support) and
+     close < sr_support_bot and
+     close[1] >= sr_support_bot
+
+sr_support_confluence =
+     enable_sr_multi_window and
+     not na(sr_support) and
+     not na(sr_mid_support) and
+     math.abs(sr_support - sr_mid_support) <= sr_zone * 1.5
+
+sr_resistance_confluence =
+     enable_sr_multi_window and
+     not na(sr_resistance) and
+     not na(sr_mid_resistance) and
+     math.abs(sr_resistance - sr_mid_resistance) <= sr_zone * 1.5
+
+var float flipped_support = na
+var float flipped_resistance = na
+var int flipped_support_bar = na
+var int flipped_resistance_bar = na
+
+if enable_sr_role_flip and break_strong_resistance
+    flipped_support := sr_resistance
+    flipped_support_bar := bar_index
+
+if enable_sr_role_flip and break_strong_support
+    flipped_resistance := sr_support
+    flipped_resistance_bar := bar_index
+
+near_flipped_support =
+     not na(flipped_support) and
+     low <= flipped_support + sr_zone and
+     close >= flipped_support - sr_zone
+
+near_flipped_resistance =
+     not na(flipped_resistance) and
+     high >= flipped_resistance - sr_zone and
+     close <= flipped_resistance + sr_zone
+
+sr_support_reaction = enable_sr_quality ? f_reaction_score(true, sr_support, sr_zone, sr_len, sr_reaction_bars, sr_reaction_atr) : 0
+sr_resistance_reaction = enable_sr_quality ? f_reaction_score(false, sr_resistance, sr_zone, sr_len, sr_reaction_bars, sr_reaction_atr) : 0
+
+sr_support_vol_ok =
+     near_strong_support and
+     (
+         volume <= vol_ma or
+         close > open and volume > vol_ma
+     )
+
+sr_resistance_vol_ok =
+     near_strong_resistance and
+     (
+         volume > vol_ma and close < open or
+         volume > vol_ma * 1.3 and close <= open
+     )
+
+sr_breakout_vol_ok =
+     break_strong_resistance and
+     volume > vol_ma * vol_mult_break
+
+sr_support_quality_raw =
+     (sr_support_touches >= sr_min_touches ? 1 : 0) +
+     (sr_support_touches >= sr_min_touches + 1 ? 1 : 0) +
+     (sr_support_reaction > 0 ? 1 : 0) +
+     (sr_support_reaction >= 2 ? 1 : 0) +
+     (sr_support_vol_ok ? 1 : 0) +
+     (sr_support_confluence ? 1 : 0) +
+     (near_flipped_support ? 1 : 0)
+
+sr_resistance_quality_raw =
+     (sr_resistance_touches >= sr_min_touches ? 1 : 0) +
+     (sr_resistance_touches >= sr_min_touches + 1 ? 1 : 0) +
+     (sr_resistance_reaction > 0 ? 1 : 0) +
+     (sr_resistance_reaction >= 2 ? 1 : 0) +
+     (sr_resistance_vol_ok ? 1 : 0) +
+     (sr_resistance_confluence ? 1 : 0) +
+     (near_flipped_resistance ? 1 : 0)
+
+sr_support_quality = math.min(sr_support_quality_raw, 5)
+sr_resistance_quality = math.min(sr_resistance_quality_raw, 5)
+
+strong_support_valid =
+     not na(sr_support) and
+     sr_support_quality >= 3
+
+strong_resistance_valid =
+     not na(sr_resistance) and
+     sr_resistance_quality >= 3
+
+sr_position =
+     near_flipped_support ? "前压力转支撑" :
+     near_flipped_resistance ? "前支撑转压力" :
+     near_strong_support ? "靠近最强支撑" :
+     near_strong_resistance ? "靠近最强压力" :
+     break_strong_resistance ? "突破最强压力" :
+     break_strong_support ? "跌破最强支撑" :
+     "普通位置"
+
+var line sr_support_line = na
+var line sr_res_line = na
+var label sr_support_label = na
+var label sr_res_label = na
+var box sr_support_box = na
+var box sr_res_box = na
+
+if is_panel_bar and enable_sr_cluster and show_sr_zone
+    if not na(sr_support)
+        if na(sr_support_line)
+            sr_support_line := line.new(bar_index - sr_len, sr_support, bar_index + sr_line_extend, sr_support, color=color.new(color.green, 0), width=2)
+            sr_support_label := label.new(bar_index + sr_line_extend, sr_support, "", style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+            sr_support_box := box.new(bar_index - sr_len, sr_support_top, bar_index + sr_line_extend, sr_support_bot, bgcolor=color.new(color.green, 88), border_color=color.new(color.green, 20))
+        line.set_xy1(sr_support_line, bar_index - sr_len, sr_support)
+        line.set_xy2(sr_support_line, bar_index + sr_line_extend, sr_support)
+        label.set_xy(sr_support_label, bar_index + sr_line_extend, sr_support)
+        label.set_text(sr_support_label, "20K支撑 " + str.tostring(sr_support, format.mintick) + " Q" + str.tostring(sr_support_quality) + "/5")
+        box.set_lefttop(sr_support_box, bar_index - sr_len, sr_support_top)
+        box.set_rightbottom(sr_support_box, bar_index + sr_line_extend, sr_support_bot)
+
+    if not na(sr_resistance)
+        if na(sr_res_line)
+            sr_res_line := line.new(bar_index - sr_len, sr_resistance, bar_index + sr_line_extend, sr_resistance, color=color.new(color.red, 0), width=2)
+            sr_res_label := label.new(bar_index + sr_line_extend, sr_resistance, "", style=label.style_label_left, color=color.red, textcolor=color.white, size=size.tiny)
+            sr_res_box := box.new(bar_index - sr_len, sr_res_top, bar_index + sr_line_extend, sr_res_bot, bgcolor=color.new(color.red, 90), border_color=color.new(color.red, 20))
+        line.set_xy1(sr_res_line, bar_index - sr_len, sr_resistance)
+        line.set_xy2(sr_res_line, bar_index + sr_line_extend, sr_resistance)
+        label.set_xy(sr_res_label, bar_index + sr_line_extend, sr_resistance)
+        label.set_text(sr_res_label, "20K压力 " + str.tostring(sr_resistance, format.mintick) + " Q" + str.tostring(sr_resistance_quality) + "/5")
+        box.set_lefttop(sr_res_box, bar_index - sr_len, sr_res_top)
+        box.set_rightbottom(sr_res_box, bar_index + sr_line_extend, sr_res_bot)
+
+
+// ============================================================================
+// 7. RSI 背离：确认当根显示，不回画
+// ============================================================================
 
 rsi_ph = ta.pivothigh(rsi_val, div_left, div_right)
 rsi_pl = ta.pivotlow(rsi_val, div_left, div_right)
@@ -210,8 +610,8 @@ var float prev_rsi_ph = na
 var float prev_price_pl = na
 var float prev_rsi_pl = na
 
-bear_div_confirmed = false
-bull_div_confirmed = false
+bool bear_div_confirmed = false
+bool bull_div_confirmed = false
 
 if not na(price_ph) and not na(rsi_ph)
     bear_div_confirmed := not na(prev_price_ph) and price_ph > prev_price_ph and rsi_ph < prev_rsi_ph and rsi_ph > 50
@@ -223,12 +623,12 @@ if not na(price_pl) and not na(rsi_pl)
     prev_price_pl := price_pl
     prev_rsi_pl := rsi_pl
 
-plotshape(show_divergence and bear_div_confirmed, title="确认熊背离", style=shape.labeldown, location=location.abovebar, color=color.red, text="熊背", textcolor=color.white, size=size.tiny, offset=-div_right)
-plotshape(show_divergence and bull_div_confirmed, title="确认牛背离", style=shape.labelup, location=location.belowbar, color=color.green, text="牛背", textcolor=color.white, size=size.tiny, offset=-div_right)
+plotshape(is_visible_bar and show_divergence and bear_div_confirmed, title="确认熊背离", style=shape.labeldown, location=location.abovebar, color=color.red, text="熊背", textcolor=color.white, size=size.tiny)
+plotshape(is_visible_bar and show_divergence and bull_div_confirmed, title="确认牛背离", style=shape.labelup, location=location.belowbar, color=color.green, text="牛背", textcolor=color.white, size=size.tiny)
 
 
 // ============================================================================
-// 7. 市场结构：Swing / BOS
+// 8. 市场结构 Swing / BOS / CHoCH
 // ============================================================================
 
 swing_high = ta.pivothigh(high, swing_len, swing_len)
@@ -238,102 +638,197 @@ var float last_sh = na
 var float last_sl = na
 var int struct_dir = 0
 
-// [更新] 避免 nz(last_sh) 初期变成0导致的早期误判。
 if not na(swing_high)
-    if not na(last_sh)
-        struct_dir := swing_high > last_sh ? 1 : -1
     last_sh := swing_high
 
 if not na(swing_low)
-    if not na(last_sl)
-        struct_dir := swing_low > last_sl ? 1 : -1
     last_sl := swing_low
 
-// [更新] BOS 加入 Ichimoku 当前云层过滤。
-bos_bullish = not na(last_sh) and close > last_sh and close[1] <= last_sh and struct_dir == 1 and price_above_cloud and cloud_bullish
-bos_bearish = not na(last_sl) and close < last_sl and close[1] >= last_sl and struct_dir == -1 and price_below_cloud and cloud_bearish
+bos_bullish_raw =
+     not na(last_sh) and
+     close > last_sh + atr_val * bos_atr_buffer and
+     close[1] <= last_sh and
+     trend_strength_ok and
+     atr_ok
 
-plotshape(show_smc_tools and show_market_structure and bos_bullish, title="BOS多", style=shape.triangleup, location=location.belowbar, color=color.lime, text="BOS", textcolor=color.lime, size=size.tiny)
-plotshape(show_smc_tools and show_market_structure and bos_bearish, title="BOS空", style=shape.triangledown, location=location.abovebar, color=color.fuchsia, text="BOS", textcolor=color.fuchsia, size=size.tiny)
+bos_bearish_raw =
+     not na(last_sl) and
+     close < last_sl - atr_val * bos_atr_buffer and
+     close[1] >= last_sl and
+     trend_strength_ok and
+     atr_ok
+
+bos_bullish = bos_bullish_raw and (price_above_cloud or is_aggressive)
+bos_bearish = bos_bearish_raw and (price_below_cloud or is_aggressive)
+
+choch_bullish =
+     struct_dir == -1 and
+     not na(last_sh) and
+     close > last_sh and
+     close > ma20
+
+choch_bearish =
+     struct_dir == 1 and
+     not na(last_sl) and
+     close < last_sl and
+     close < ma20
+
+if bos_bullish or choch_bullish
+    struct_dir := 1
+
+if bos_bearish or choch_bearish
+    struct_dir := -1
+
+plotshape(is_visible_bar and show_smc_tools and show_market_structure and bos_bullish, title="BOS多", style=shape.triangleup, location=location.belowbar, color=color.lime, text="BOS", textcolor=color.lime, size=size.tiny)
+plotshape(is_visible_bar and show_smc_tools and show_market_structure and choch_bullish, title="CHoCH多", style=shape.circle, location=location.belowbar, color=color.green, text="CH", textcolor=color.white, size=size.tiny)
+plotshape(is_visible_bar and show_smc_tools and show_market_structure and bos_bearish, title="下破结构风险", style=shape.triangledown, location=location.abovebar, color=color.red, text="破位", textcolor=color.white, size=size.tiny)
+plotshape(is_visible_bar and show_smc_tools and show_market_structure and choch_bearish, title="转弱风险", style=shape.circle, location=location.abovebar, color=color.orange, text="弱", textcolor=color.white, size=size.tiny)
 
 
 // ============================================================================
-// 8. OB / FVG，对象数量控制
+// 9. OB / FVG
 // ============================================================================
-// [更新] 使用 array 保存 box，并在超过上限后删除最旧对象。
 
 var box[] ob_boxes = array.new_box()
 var box[] fvg_boxes = array.new_box()
 
-// 更保守的 OB：必须配合 BOS 出现。
-bullish_ob = bos_bullish and close[1] < open[1] and volume > vol_ma20
-bearish_ob = bos_bearish and close[1] > open[1] and volume > vol_ma20
+f_last_down_candle(_lookback) =>
+    float top = na
+    float bot = na
+    int idx = na
+    for i = 1 to _lookback
+        if na(top) and close[i] < open[i]
+            top := high[i]
+            bot := low[i]
+            idx := bar_index - i
+    [top, bot, idx]
 
-if show_smc_tools and show_ob and bullish_ob
-    b_ob = box.new(bar_index - 1, high[1], bar_index + 20, low[1], bgcolor=color.new(color.green, 86), border_color=color.green, border_width=1)
-    array.push(ob_boxes, b_ob)
-    if array.size(ob_boxes) > max_ob_boxes
-        old_ob = array.shift(ob_boxes)
-        box.delete(old_ob)
+f_last_up_candle(_lookback) =>
+    float top = na
+    float bot = na
+    int idx = na
+    for i = 1 to _lookback
+        if na(top) and close[i] > open[i]
+            top := high[i]
+            bot := low[i]
+            idx := bar_index - i
+    [top, bot, idx]
 
-if show_smc_tools and show_ob and bearish_ob
-    b_ob = box.new(bar_index - 1, high[1], bar_index + 20, low[1], bgcolor=color.new(color.red, 86), border_color=color.red, border_width=1)
-    array.push(ob_boxes, b_ob)
-    if array.size(ob_boxes) > max_ob_boxes
-        old_ob = array.shift(ob_boxes)
-        box.delete(old_ob)
+var float last_bull_ob_top = na
+var float last_bull_ob_bot = na
+var float last_bear_ob_top = na
+var float last_bear_ob_bot = na
 
-// FVG 定义
-bull_fvg = low > high[2] and close > open
-bear_fvg = high < low[2] and close < open
+if is_visible_bar and show_smc_tools and show_ob and (bos_bullish or choch_bullish)
+    [ob_top, ob_bot, ob_idx] = f_last_down_candle(ob_lookback)
+    if not na(ob_top) and not na(ob_idx)
+        b_ob = box.new(ob_idx, ob_top, bar_index + 35, ob_bot, bgcolor=color.new(color.green, 86), border_color=color.green, border_width=1)
+        array.push(ob_boxes, b_ob)
+        last_bull_ob_top := ob_top
+        last_bull_ob_bot := ob_bot
+        if array.size(ob_boxes) > max_ob_boxes
+            old_ob = array.shift(ob_boxes)
+            box.delete(old_ob)
 
-if show_smc_tools and show_fvg and bull_fvg
-    b_fvg = box.new(bar_index - 1, low, bar_index + 15, high[2], bgcolor=color.new(color.teal, 88), border_color=color.teal, border_width=1)
+if is_visible_bar and show_smc_tools and show_ob and (bos_bearish or choch_bearish)
+    [ob_top, ob_bot, ob_idx] = f_last_up_candle(ob_lookback)
+    if not na(ob_top) and not na(ob_idx)
+        b_ob = box.new(ob_idx, ob_top, bar_index + 35, ob_bot, bgcolor=color.new(color.red, 88), border_color=color.red, border_width=1)
+        array.push(ob_boxes, b_ob)
+        last_bear_ob_top := ob_top
+        last_bear_ob_bot := ob_bot
+        if array.size(ob_boxes) > max_ob_boxes
+            old_ob = array.shift(ob_boxes)
+            box.delete(old_ob)
+
+bull_fvg = low > high[2] and close > open and (low - high[2]) >= atr_val * min_fvg_atr
+bear_fvg = high < low[2] and close < open and (low[2] - high) >= atr_val * min_fvg_atr
+
+var float last_bull_fvg_top = na
+var float last_bull_fvg_bot = na
+var float last_bear_fvg_top = na
+var float last_bear_fvg_bot = na
+
+if is_visible_bar and show_smc_tools and show_fvg and bull_fvg
+    b_fvg = box.new(bar_index - 2, low, bar_index + 30, high[2], bgcolor=color.new(color.teal, 88), border_color=color.teal, border_width=1)
     array.push(fvg_boxes, b_fvg)
+    last_bull_fvg_top := low
+    last_bull_fvg_bot := high[2]
     if array.size(fvg_boxes) > max_fvg_boxes
         old_fvg = array.shift(fvg_boxes)
         box.delete(old_fvg)
 
-if show_smc_tools and show_fvg and bear_fvg
-    b_fvg = box.new(bar_index - 1, low[2], bar_index + 15, high, bgcolor=color.new(color.maroon, 88), border_color=color.maroon, border_width=1)
+if is_visible_bar and show_smc_tools and show_fvg and bear_fvg
+    b_fvg = box.new(bar_index - 2, low[2], bar_index + 30, high, bgcolor=color.new(color.maroon, 90), border_color=color.maroon, border_width=1)
     array.push(fvg_boxes, b_fvg)
+    last_bear_fvg_top := low[2]
+    last_bear_fvg_bot := high
     if array.size(fvg_boxes) > max_fvg_boxes
         old_fvg = array.shift(fvg_boxes)
         box.delete(old_fvg)
+
+near_bull_ob = not na(last_bull_ob_top) and low <= last_bull_ob_top and close >= last_bull_ob_bot
+near_bull_fvg = not na(last_bull_fvg_top) and low <= last_bull_fvg_top and close >= last_bull_fvg_bot
+
+near_pressure_ob = not na(last_bear_ob_bot) and high >= last_bear_ob_bot and close <= last_bear_ob_top
+near_pressure_fvg = not na(last_bear_fvg_bot) and high >= last_bear_fvg_bot and close <= last_bear_fvg_top
 
 
 // ============================================================================
-// 9. K线形态：有量确认版
+// 10. K线形态 / 扫盘
 // ============================================================================
 
 body_size = math.abs(close - open)
 upper_wick = high - math.max(close, open)
 lower_wick = math.min(close, open) - low
+bar_range = math.max(high - low, syminfo.mintick)
 
-is_hammer = lower_wick > body_size * 2 and upper_wick < body_size * 0.7 and close > open and rsi_val < 45
-has_volume = volume > vol_ma20 * 1.3
+close_pos = (close - low) / bar_range
+has_volume = volume > vol_ma * 1.25
 
-bull_engulf = close[1] < open[1] and close > open and close > open[1] and open < close[1] and has_volume
-bear_engulf = close[1] > open[1] and close < open and close < open[1] and open > close[1] and has_volume
+is_hammer = lower_wick > body_size * 2 and upper_wick < body_size * 0.8 and close > open and close_pos > 0.55
+is_shooting_star = upper_wick > body_size * 2 and lower_wick < body_size * 0.8 and close < open and close_pos < 0.45
 
-plotshape(show_patterns and is_hammer, title="锤子", style=shape.diamond, location=location.belowbar, color=color.lime, text="锤", textcolor=color.lime, size=size.tiny)
-plotshape(show_patterns and bull_engulf, title="看涨吞没(有量)", style=shape.arrowup, location=location.belowbar, color=color.green, text="涨吞", textcolor=color.green, size=size.tiny)
-plotshape(show_patterns and bear_engulf, title="看跌吞没(有量)", style=shape.arrowdown, location=location.abovebar, color=color.red, text="跌吞", textcolor=color.red, size=size.tiny)
+bull_engulf = close[1] < open[1] and close > open and close > open[1] and open < close[1] and volume > vol_ma
+bear_engulf = close[1] > open[1] and close < open and close < open[1] and open > close[1] and volume > vol_ma
+
+sweep_low =
+     low < ta.lowest(low[1], sweep_len) and
+     close > open and
+     close_pos > 0.60
+
+sweep_high =
+     high > ta.highest(high[1], sweep_len) and
+     close < open and
+     close_pos < 0.40
+
+plotshape(is_visible_bar and show_patterns and is_hammer, title="锤子", style=shape.diamond, location=location.belowbar, color=color.lime, text="锤", textcolor=color.lime, size=size.tiny)
+plotshape(is_visible_bar and show_patterns and bull_engulf, title="看涨吞没", style=shape.arrowup, location=location.belowbar, color=color.green, text="吞", textcolor=color.green, size=size.tiny)
+plotshape(is_visible_bar and show_patterns and bear_engulf, title="看跌吞没", style=shape.arrowdown, location=location.abovebar, color=color.red, text="跌吞", textcolor=color.white, size=size.tiny)
+plotshape(is_visible_bar and show_patterns and sweep_low, title="扫低收回", style=shape.circle, location=location.belowbar, color=color.new(color.green, 0), text="扫低", textcolor=color.white, size=size.tiny)
+plotshape(is_visible_bar and show_patterns and sweep_high, title="扫高回落", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), text="扫高", textcolor=color.white, size=size.tiny)
 
 
 // ============================================================================
-// 10. 多周期趋势
+// 11. 多周期趋势：非重绘 HTF
 // ============================================================================
-// [更新] 周线用 MA20，月线用 MA10，比月线 MA50 更适合A股波段交易。
-// [说明] lookahead_off 避免历史K线偷看未来高周期数据。
 
-d_close = request.security(syminfo.tickerid, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
-w_close = request.security(syminfo.tickerid, "W", close, barmerge.gaps_off, barmerge.lookahead_off)
-m_close = request.security(syminfo.tickerid, "M", close, barmerge.gaps_off, barmerge.lookahead_off)
+f_htf(_tf, _expr) =>
+    request.security(
+         syminfo.tickerid,
+         _tf,
+         use_confirmed_htf ? _expr[1] : _expr,
+         gaps=barmerge.gaps_off,
+         lookahead=use_confirmed_htf ? barmerge.lookahead_on : barmerge.lookahead_off
+     )
 
-d_ma_trend = request.security(syminfo.tickerid, "D", ta.sma(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
-w_ma_trend = request.security(syminfo.tickerid, "W", ta.sma(close, 20), barmerge.gaps_off, barmerge.lookahead_off)
-m_ma_trend = request.security(syminfo.tickerid, "M", ta.sma(close, 10), barmerge.gaps_off, barmerge.lookahead_off)
+d_close = f_htf(tf_d, close)
+w_close = f_htf(tf_w, close)
+m_close = f_htf(tf_m, close)
+
+d_ma_trend = f_htf(tf_d, ta.sma(close, 50))
+w_ma_trend = f_htf(tf_w, ta.sma(close, 20))
+m_ma_trend = f_htf(tf_m, ta.sma(close, 10))
 
 d_bull = d_close > d_ma_trend
 w_bull = w_close > w_ma_trend
@@ -348,237 +843,1006 @@ all_bear_aligned = not d_bull and not w_bull and not m_bull
 
 
 // ============================================================================
-// 11. 综合评分系统 v2：五大类评分
+// 12. 方向评分
 // ============================================================================
-// [更新] 避免多个趋势指标重复计分造成“虚高评分”。
-// 每个方向最多 10 分：
-// 1. 大周期趋势 0-2
-// 2. 当前周期均线趋势 0-2
-// 3. 动能 0-2
-// 4. 量能 0-2
-// 5. 结构/位置 0-2
 
 bull_trend_score = (d_bull ? 1 : 0) + (w_bull ? 1 : 0)
 bear_trend_score = (not d_bull ? 1 : 0) + (not w_bull ? 1 : 0)
 
-bull_ma_score = (close > ma50 ? 1 : 0) + (close > ma200 ? 1 : 0)
-bear_ma_score = (close < ma50 ? 1 : 0) + (close < ma200 ? 1 : 0)
+bull_ma_score = (close > ma50 ? 1 : 0) + (ma20_slope_up and ma50_slope_up ? 1 : 0)
+bear_ma_score = (close < ma50 ? 1 : 0) + (ma20_slope_dn and ma50_slope_dn ? 1 : 0)
 
 bull_momentum_score = (macd_bull ? 1 : 0) + (rsi_val > 50 and rsi_val < rsi_ob ? 1 : 0)
 bear_momentum_score = (macd_bear ? 1 : 0) + (rsi_val < 50 and rsi_val > rsi_os ? 1 : 0)
 
-bull_volume_score = (volume > vol_ma20 ? 1 : 0) + (volume > vol_ma20 * 1.2 and close > open ? 1 : 0)
-bear_volume_score = (volume > vol_ma20 ? 1 : 0) + (volume > vol_ma20 * 1.2 and close < open ? 1 : 0)
+bull_volume_score = (volume > vol_ma ? 1 : 0) + (vol_expansion_bull ? 1 : 0)
+bear_volume_score = (volume > vol_ma ? 1 : 0) + (vol_expansion_bear ? 1 : 0)
 
 bull_structure_score = (price_above_cloud ? 1 : 0) + (struct_dir == 1 ? 1 : 0)
 bear_structure_score = (price_below_cloud ? 1 : 0) + (struct_dir == -1 ? 1 : 0)
 
-// VWAP作为日内微调，不纳入10分总分，避免日线图干扰。
-vwap_bias = use_vwap ? (close > vwap_val ? 1 : close < vwap_val ? -1 : 0) : 0
-
 bull_score = bull_trend_score + bull_ma_score + bull_momentum_score + bull_volume_score + bull_structure_score
 bear_score = bear_trend_score + bear_ma_score + bear_momentum_score + bear_volume_score + bear_structure_score
-net_score = bull_score - bear_score
 
-uptrend_confirmed = price_above_cloud and cloud_bullish and tk_cross_bull and struct_dir == 1
-downtrend_confirmed = price_below_cloud and cloud_bearish and tk_cross_bear and struct_dir == -1
+direction_bias = bull_score > bear_score ? "多头占优" : bear_score > bull_score ? "转弱/风控" : "中性"
 
-// [更新] 回踩条件更严格：必须在趋势确认后，回踩关键均线并收回。
-pullback_to_support = uptrend_confirmed and low <= math.max(ma20, ma50) and close > ma20 and close > open and volume <= vol_ma20 * 2.0
-pullback_to_resistance = downtrend_confirmed and high >= math.min(ma20, ma50) and close < ma20 and close < open and volume <= vol_ma20 * 2.0
+uptrend_confirmed = price_above_ma20 and price_above_ma50 and (struct_dir == 1 or ma20_slope_up)
+
+
+// ============================================================================
+// 13. 多头机会 / 持仓管理原始条件
+// ============================================================================
 
 bar_confirmed = confirm_on_close ? barstate.isconfirmed : true
 
-signal_bull = show_signals and bar_confirmed and bull_score >= min_score and net_score >= 3 and uptrend_confirmed and pullback_to_support and not in_the_cloud
-signal_bear = show_signals and bar_confirmed and bear_score >= min_score and net_score <= -3 and downtrend_confirmed and pullback_to_resistance and not in_the_cloud
+long_chase_ok = not na(last_sh) and close - last_sh <= atr_val * max_chase_atr
+sr_break_chase_ok = not na(sr_resistance) and close - sr_resistance <= atr_val * max_chase_atr
 
-plotshape(signal_bull and not signal_bull[1], title="BUY(趋势+回踩)", style=shape.labelup, location=location.belowbar, color=color.green, text="BUY", textcolor=color.white, size=size.normal)
-plotshape(signal_bear and not signal_bear[1], title="SELL(趋势+回踩)", style=shape.labeldown, location=location.abovebar, color=color.red, text="SELL", textcolor=color.white, size=size.normal)
+price_too_extended = close > ma20 + atr_val * no_chase_atr
+extended_up = close - ma20 > atr_val * extension_atr
+
+watch_bull_sweep =
+     allow_countertrend_watch and
+     sweep_low and
+     (rsi_val < 50 or close <= bb_lower + atr_val * 0.5 or near_strong_support and strong_support_valid)
+
+watch_bull_reversal =
+     allow_countertrend_watch and
+     (is_hammer or bull_engulf or bull_div_confirmed) and
+     macd_hist_rising and
+     close > low + atr_val * 0.5
+
+watch_bull_reclaim =
+     ma20_reclaim and
+     rsi_val > 45 and
+     macd_hist_rising
+
+watch_bull_location =
+     near_bull_ob or
+     near_bull_fvg or
+     near_strong_support and strong_support_valid or
+     near_flipped_support or
+     low <= ma50 or
+     low <= bb_lower or
+     low <= cloud_top
+
+watch_long_raw =
+     is_visible_bar and
+     (
+         watch_bull_sweep or
+         watch_bull_reversal or
+         watch_bull_reclaim or
+         (watch_bull_location and close > open and macd_hist_rising)
+     )
+
+early_reclaim_setup =
+     allow_early_setup and
+     ma20_reclaim and
+     close > ema21 and
+     macd_hist_rising and
+     rsi_val > 48
+
+pullback_setup =
+     allow_early_setup and
+     price_above_ma20 and
+     (
+         low <= ma20 or
+         near_bull_ob or
+         near_bull_fvg or
+         near_strong_support and strong_support_valid or
+         near_flipped_support or
+         low <= cloud_top
+     ) and
+     close > open and
+     rsi_val > 45
+
+choch_setup =
+     allow_early_setup and
+     choch_bullish and
+     close > ma20
+
+setup_long_raw =
+     is_visible_bar and
+     not chop_market and
+     not price_too_extended and
+     (
+         early_reclaim_setup or
+         pullback_setup or
+         choch_setup
+     )
+
+breakout_buy =
+     not chop_market and
+     not price_too_extended and
+     (
+         (
+             not na(last_sh) and
+             close > last_sh + atr_val * bos_atr_buffer and
+             close[1] <= last_sh and
+             long_chase_ok
+         ) or
+         (
+             break_strong_resistance and
+             strong_resistance_valid and
+             sr_breakout_vol_ok and
+             sr_break_chase_ok
+         )
+     ) and
+     bull_score >= min_dir_score and
+     (vol_expansion_bull or is_aggressive) and
+     (price_above_cloud or is_aggressive)
+
+pullback_buy =
+     not chop_market and
+     not price_too_extended and
+     uptrend_confirmed and
+     bull_score >= math.max(4, min_dir_score - 1) and
+     (
+         low <= ma20 or
+         low <= ma50 or
+         near_bull_ob or
+         near_bull_fvg or
+         near_strong_support and strong_support_valid or
+         near_flipped_support or
+         low <= cloud_top
+     ) and
+     close > open and
+     close > ma20 and
+     macd_hist_rising
+
+reversal_buy =
+     not chop_market and
+     not price_too_extended and
+     (
+         bull_div_confirmed or
+         sweep_low or
+         is_hammer or
+         bull_engulf or
+         near_strong_support and strong_support_valid or
+         near_flipped_support
+     ) and
+     macd_hist_rising and
+     rsi_val > rsi_val[1] and
+     close > ma20 and
+     bull_score >= math.max(4, min_dir_score - 2)
+
+long_trigger_raw = breakout_buy or pullback_buy or reversal_buy
+
+add_raw =
+     is_visible_bar and
+     not chop_market and
+     not price_too_extended and
+     uptrend_confirmed and
+     (
+         low <= ma20 or
+         low <= ema21 or
+         near_bull_ob or
+         near_bull_fvg or
+         near_strong_support and strong_support_valid or
+         near_flipped_support
+     ) and
+     close > open and
+     close > ma20 and
+     macd_hist_rising and
+     rsi_val > 50
+
+upper_reject = high >= bb_upper and close < open and close_pos < 0.50
+pressure_reject = (near_pressure_ob or near_pressure_fvg or near_strong_resistance or near_flipped_resistance) and close < open
+
+reduce_long_raw =
+     is_visible_bar and
+     (
+         (reduce_on_upper_band and upper_reject) or
+         (reduce_on_sweep_high and sweep_high) or
+         (reduce_on_bear_div and bear_div_confirmed) or
+         bear_engulf or
+         pressure_reject or
+         (extended_up and macd_hist_falling) or
+         (rsi_val > rsi_ob and close < open)
+     )
+
+risk_warning_raw =
+     is_visible_bar and
+     (
+         ma20_lost or
+         choch_bearish or
+         break_strong_support or
+         macd_bear and rsi_val < 50
+     )
+
+risk_off_long_raw =
+     is_visible_bar and
+     (
+         (risk_off_on_ma20_lost and ma20_lost and volume > vol_ma * risk_off_volume_mult) or
+         (risk_off_on_ma50_lost and ma50_lost) or
+         bos_bearish or
+         break_strong_support or
+         close < ma50 and macd_bear
+     )
+
+hold_raw =
+     is_visible_bar and
+     uptrend_confirmed and
+     close > ma20 and
+     macd_hist_rising and
+     not reduce_long_raw and
+     not risk_warning_raw and
+     not risk_off_long_raw
 
 
 // ============================================================================
-// 12. ATR 风险参考线
+// 14. 入场计划与评分
 // ============================================================================
-// [更新] 这是 indicator，不是 strategy，因此这里只提供风险参考线，不宣称自动交易。
 
-is_bullish_context = bull_score >= bear_score
+breakout_entry_price =
+     break_strong_resistance and not na(sr_res_top) ? sr_res_top :
+     not na(last_sh) ? last_sh + atr_val * bos_atr_buffer :
+     close
 
-entry_price = close
-sl_price = is_bullish_context ? close - atr_val * atr_sl_mult : close + atr_val * atr_sl_mult
-tp1_price = is_bullish_context ? close + atr_val * atr_tp_mult : close - atr_val * atr_tp_mult
-tp2_price = is_bullish_context ? close + atr_val * atr_tp_mult * 2.0 : close - atr_val * atr_tp_mult * 2.0
-tp3_price = is_bullish_context ? close + atr_val * atr_tp_mult * 3.0 : close - atr_val * atr_tp_mult * 3.0
-rr_ratio = atr_tp_mult / atr_sl_mult
+support_sl_price =
+     near_strong_support and strong_support_valid and not na(sr_support_bot) ? sr_support_bot - atr_val * 0.20 :
+     near_flipped_support and not na(flipped_support) ? flipped_support - sr_zone - atr_val * 0.20 :
+     na
 
-// [更新] 只创建一次线/标签，然后在最后一根K线更新。
+long_entry =
+     breakout_buy ? breakout_entry_price :
+     pullback_buy ? close :
+     reversal_buy ? close :
+     setup_long_raw ? close :
+     add_raw ? close :
+     na
+
+long_sl_struct =
+     breakout_buy ? math.min(low, breakout_entry_price - atr_val * 0.5) :
+     pullback_buy ? not na(support_sl_price) ? support_sl_price : math.min(low, ma50) :
+     reversal_buy ? not na(support_sl_price) ? support_sl_price : low :
+     setup_long_raw ? not na(support_sl_price) ? support_sl_price : low :
+     add_raw ? not na(support_sl_price) ? support_sl_price : low :
+     na
+
+long_sl_atr = not na(long_entry) ? long_entry - atr_val * atr_sl_mult : na
+long_sl = not na(long_sl_struct) and not na(long_sl_atr) ? math.min(long_sl_struct, long_sl_atr) : na
+
+long_risk = not na(long_entry) and not na(long_sl) ? long_entry - long_sl : na
+
+sr_target_valid =
+     not na(sr_resistance) and
+     not na(long_entry) and
+     not na(long_risk) and
+     sr_resistance > long_entry and
+     sr_resistance - long_entry >= long_risk * 0.8
+
+long_t1_by_sr = sr_target_valid ? sr_resistance : na
+long_t1_by_r = not na(long_entry) and not na(long_risk) ? long_entry + long_risk * rr_t1_mult : na
+
+long_t1 = sr_target_valid ? long_t1_by_sr : long_t1_by_r
+long_t2 = not na(long_entry) and not na(long_risk) ?
+     sr_target_valid ? math.max(long_t1 + long_risk, long_entry + long_risk * rr_t2_mult) : long_entry + long_risk * rr_t2_mult :
+     na
+
+plan_entry = long_entry
+plan_sl = long_sl
+plan_t1 = long_t1
+plan_t2 = long_t2
+
+plan_risk = not na(plan_entry) and not na(plan_sl) ? math.abs(plan_entry - plan_sl) : na
+plan_reward = not na(plan_entry) and not na(plan_t1) ? math.abs(plan_t1 - plan_entry) : na
+plan_rr = not na(plan_risk) and plan_risk > 0 ? plan_reward / plan_risk : na
+
+rr_ok = not na(plan_rr) and plan_rr >= min_rr
+rr_soft_ok = not na(plan_rr) and plan_rr >= min_rr * 0.75
+
+long_eq_trend = all_bull_aligned or (d_bull and w_bull) or price_above_ma50 ? 1 : 0
+long_eq_location = near_bull_ob or near_bull_fvg or near_strong_support and strong_support_valid or near_flipped_support or pullback_buy or low <= ma20 or low <= bb_lower ? 1 : 0
+long_eq_volume = breakout_buy and vol_expansion_bull or pullback_buy or reversal_buy and has_volume or setup_long_raw or add_raw ? 1 : 0
+long_eq_momentum = macd_bull and rsi_val > 50 or macd_hist_rising and rsi_val > rsi_val[1] ? 1 : 0
+long_eq_rr = rr_ok ? 1 : rr_soft_ok and is_aggressive ? 1 : 0
+
+sr_quality_bonus =
+     enable_sr_cluster and
+     (
+         near_strong_support and strong_support_valid or
+         break_strong_resistance and strong_resistance_valid and sr_breakout_vol_ok or
+         near_flipped_support
+     ) ? 1 : 0
+
+entry_quality_raw =
+     (long_trigger_raw or setup_long_raw or add_raw) ?
+     long_eq_trend + long_eq_location + long_eq_volume + long_eq_momentum + long_eq_rr + sr_quality_bonus :
+     0
+
+entry_quality = math.min(entry_quality_raw, 5)
+
+entry_quality_text =
+     entry_quality >= 4 ? str.tostring(entry_quality) + "/5 优质" :
+     entry_quality == 3 ? str.tostring(entry_quality) + "/5 可做" :
+     entry_quality >= 1 ? str.tostring(entry_quality) + "/5 偏弱" :
+     "0/5 无机会"
+
+
+// ============================================================================
+// 15. 实际持仓 / 做T辅助模块
+// ============================================================================
+
+has_position_input = enable_t_plan and user_cost > 0 and user_qty > 0
+effective_t_qty = t_qty > 0 ? math.min(t_qty, user_qty) : user_qty
+
+position_cost_value = has_position_input ? user_cost * user_qty : na
+position_market_value = has_position_input ? close * user_qty : na
+position_pnl = has_position_input ? (close - user_cost) * user_qty : na
+position_pnl_pct = has_position_input ? (close - user_cost) / user_cost * 100.0 : na
+
+t_sell_by_res =
+     not na(sr_resistance) and sr_resistance > close ?
+     sr_resistance - atr_val * t_sell_atr_buffer :
+     na
+
+t_sell_by_bb =
+     bb_upper > close ?
+     bb_upper :
+     na
+
+t_sell_by_atr =
+     close + atr_val * 0.80
+
+t_sell_target =
+     not na(t_sell_by_res) ? t_sell_by_res :
+     not na(t_sell_by_bb) ? t_sell_by_bb :
+     t_sell_by_atr
+
+t_buy_by_support =
+     not na(sr_support) and sr_support < close ?
+     sr_support + atr_val * t_buy_atr_buffer :
+     na
+
+t_buy_by_flip =
+     not na(flipped_support) and flipped_support < close ?
+     flipped_support + atr_val * t_buy_atr_buffer :
+     na
+
+t_buy_by_ma20 =
+     ma20 < close ? ma20 : na
+
+t_buy_by_vwap =
+     use_vwap and vwap_val < close ? vwap_val : na
+
+t_buy_by_bb_mid =
+     bb_basis < close ? bb_basis : na
+
+t_buyback_target =
+     not na(t_buy_by_support) ? t_buy_by_support :
+     not na(t_buy_by_flip) ? t_buy_by_flip :
+     not na(t_buy_by_ma20) ? t_buy_by_ma20 :
+     not na(t_buy_by_vwap) ? t_buy_by_vwap :
+     not na(t_buy_by_bb_mid) ? t_buy_by_bb_mid :
+     close - atr_val * 0.60
+
+t_space = not na(t_sell_target) and not na(t_buyback_target) ? t_sell_target - t_buyback_target : na
+t_space_pct = not na(t_space) and close > 0 ? t_space / close * 100.0 : na
+
+t_buy_cost_fee = not na(t_buyback_target) ? t_buyback_target * effective_t_qty * t_commission_rate / 100.0 : na
+t_sell_fee = not na(t_sell_target) ? t_sell_target * effective_t_qty * (t_commission_rate + t_sell_tax_rate) / 100.0 : na
+t_total_fee = not na(t_buy_cost_fee) and not na(t_sell_fee) ? t_buy_cost_fee + t_sell_fee : na
+
+t_gross_profit = not na(t_space) ? t_space * effective_t_qty : na
+t_net_profit = not na(t_gross_profit) and not na(t_total_fee) ? t_gross_profit - t_total_fee : na
+
+t_space_ok =
+     enable_t_plan and
+     has_position_input and
+     not na(t_space_pct) and
+     t_space_pct >= t_min_profit_pct and
+     t_net_profit > 0
+
+t_sell_zone =
+     t_space_ok and
+     (
+         near_strong_resistance or
+         near_flipped_resistance or
+         sweep_high or
+         upper_reject or
+         extended_up or
+         high >= t_sell_target
+     )
+
+t_buyback_zone =
+     t_space_ok and
+     (
+         near_strong_support and strong_support_valid or
+         near_flipped_support or
+         low <= t_buyback_target or
+         sweep_low or
+         is_hammer or
+         bull_engulf
+     )
+
+t_status =
+     not enable_t_plan ? "未启用" :
+     not has_position_input ? "未输入持仓" :
+     not t_space_ok ? "T空间不足" :
+     t_sell_zone ? "可高抛观察" :
+     t_buyback_zone ? "可低吸观察" :
+     "等待T机会"
+
+
+// ============================================================================
+// 16. 冷却函数与虚拟持仓状态机
+// ============================================================================
+
+f_cd_ok(_last_bar, _cooldown) =>
+    na(_last_bar) or bar_index - _last_bar > _cooldown
+
+var int pos_state = 0
+// 0 空仓 / 无计划
+// 1 WATCH
+// 2 SETUP
+// 3 LONG已建仓
+// 4 HOLD持有
+// 5 REDUCED已减仓
+// 6 RISK OFF已退出
+
+var int last_long_bar = na
+var int last_add_bar = na
+var int last_setup_bar = na
+var int last_reduce_bar = na
+var int last_risk_bar = na
+var int last_exit_bar = na
+
+can_long = f_cd_ok(last_long_bar, long_cooldown)
+can_add = f_cd_ok(last_add_bar, add_cooldown)
+can_setup = f_cd_ok(last_setup_bar, setup_cooldown)
+can_reduce = f_cd_ok(last_reduce_bar, reduce_cooldown)
+can_risk = f_cd_ok(last_risk_bar, risk_cooldown)
+
+in_position = pos_state == 3 or pos_state == 4 or pos_state == 5
+flat_state = pos_state == 0 or pos_state == 1 or pos_state == 2 or pos_state == 6
+
+confirmed_long_raw =
+     is_visible_bar and
+     show_signals and
+     bar_confirmed and
+     long_trigger_raw and
+     entry_quality >= min_entry_quality and
+     (rr_ok or is_aggressive and rr_soft_ok)
+
+confirmed_setup_raw =
+     is_visible_bar and
+     show_signals and
+     bar_confirmed and
+     setup_long_raw and
+     can_setup and
+     not confirmed_long_raw
+
+confirmed_add_raw =
+     is_visible_bar and
+     show_signals and
+     bar_confirmed and
+     add_raw and
+     in_position and
+     can_add
+
+confirmed_reduce_raw =
+     is_visible_bar and
+     show_signals and
+     bar_confirmed and
+     reduce_long_raw and
+     in_position and
+     can_reduce
+
+confirmed_risk_off_raw =
+     is_visible_bar and
+     show_signals and
+     bar_confirmed and
+     risk_off_long_raw and
+     in_position and
+     can_risk
+
+confirmed_risk_warning_raw =
+     is_visible_bar and
+     show_signals and
+     bar_confirmed and
+     risk_warning_raw and
+     in_position and
+     can_risk and
+     not confirmed_risk_off_raw
+
+confirmed_long =
+     use_state_machine ?
+     confirmed_long_raw and flat_state and can_long :
+     confirmed_long_raw and can_long
+
+confirmed_setup_long =
+     use_state_machine ?
+     confirmed_setup_raw and (pos_state == 0 or pos_state == 1 or pos_state == 6) :
+     confirmed_setup_raw
+
+confirmed_add =
+     use_state_machine ?
+     confirmed_add_raw and (pos_state == 3 or pos_state == 4) :
+     confirmed_add_raw
+
+confirmed_reduce_long =
+     use_state_machine ?
+     confirmed_reduce_raw and (pos_state == 3 or pos_state == 4) :
+     confirmed_reduce_raw
+
+confirmed_risk_off_long =
+     use_state_machine ?
+     confirmed_risk_off_raw and in_position :
+     confirmed_risk_off_raw
+
+confirmed_risk_warning =
+     use_state_machine ?
+     confirmed_risk_warning_raw and in_position :
+     confirmed_risk_warning_raw
+
+watch_long =
+     use_state_machine ?
+     watch_long_raw and (pos_state == 0 or pos_state == 6) :
+     watch_long_raw
+
+hold_long =
+     use_state_machine ?
+     hold_raw and in_position and not confirmed_reduce_long and not confirmed_risk_warning and not confirmed_risk_off_long :
+     hold_raw
+
+do_not_chase =
+     is_visible_bar and price_too_extended and not in_position and bull_score >= math.max(4, min_dir_score - 1)
+
+warning_long =
+     is_visible_bar and
+     enable_intrabar_warning and
+     not barstate.isconfirmed and
+     (watch_long or setup_long_raw or long_trigger_raw)
+
+if is_visible_bar and bar_confirmed
+    if confirmed_risk_off_long
+        pos_state := 6
+        last_risk_bar := bar_index
+        last_exit_bar := bar_index
+    else if confirmed_reduce_long
+        pos_state := 5
+        last_reduce_bar := bar_index
+    else if confirmed_add
+        pos_state := 4
+        last_add_bar := bar_index
+    else if confirmed_long
+        pos_state := 3
+        last_long_bar := bar_index
+    else if hold_long
+        pos_state := 4
+    else if confirmed_setup_long
+        pos_state := 2
+        last_setup_bar := bar_index
+    else if watch_long and pos_state == 0
+        pos_state := 1
+
+    if pos_state == 6 and not na(last_exit_bar) and bar_index - last_exit_bar >= reset_after_risk_off and close > ma20 and macd_hist_rising
+        pos_state := 0
+
+state_text =
+     pos_state == 0 ? "空仓/无计划" :
+     pos_state == 1 ? "观察中" :
+     pos_state == 2 ? "SETUP形成" :
+     pos_state == 3 ? "已建仓" :
+     pos_state == 4 ? "持有中" :
+     pos_state == 5 ? "已减仓" :
+     pos_state == 6 ? "已退出/等待重置" :
+     "未知"
+
+
+// ============================================================================
+// 17. 交易状态与动作
+// ============================================================================
+
+trade_state =
+     confirmed_long ? "LONG INIT" :
+     confirmed_add ? "ADD" :
+     confirmed_risk_off_long ? "RISK OFF" :
+     confirmed_reduce_long ? "REDUCE / TAKE PROFIT" :
+     confirmed_risk_warning ? "RISK WARNING" :
+     confirmed_setup_long ? "LONG SETUP" :
+     hold_long ? "HOLD" :
+     watch_long ? "LONG WATCH" :
+     do_not_chase ? "DO NOT CHASE" :
+     chop_market ? "NO TRADE / CHOP" :
+     "NO TRADE"
+
+trade_state_color =
+     confirmed_long ? color.green :
+     confirmed_add ? color.lime :
+     confirmed_risk_off_long ? color.red :
+     confirmed_reduce_long ? color.orange :
+     confirmed_risk_warning ? color.orange :
+     confirmed_setup_long ? color.yellow :
+     hold_long ? color.aqua :
+     watch_long ? color.orange :
+     do_not_chase ? color.orange :
+     color.gray
+
+action_text =
+     confirmed_long ? "初次建仓" :
+     confirmed_add ? "趋势加仓" :
+     confirmed_risk_off_long ? "风险退出" :
+     confirmed_reduce_long ? "减仓/止盈" :
+     confirmed_risk_warning ? "风控警戒" :
+     confirmed_setup_long ? "多头结构形成" :
+     hold_long ? "持有不追" :
+     watch_long ? "多头观察" :
+     do_not_chase ? "过度延伸不追" :
+     chop_market ? "盘整不做" :
+     "不交易"
+
+action_color = trade_state_color
+
+buy_type =
+     confirmed_long ? "LONG初买" :
+     confirmed_add ? "ADD加仓" :
+     confirmed_setup_long ? "早期多头SETUP" :
+     hold_long ? "HOLD持有" :
+     watch_long ? "多头WATCH" :
+     do_not_chase ? "禁止追高" :
+     "无买点"
+
+manage_type =
+     confirmed_risk_off_long ? "风险退出" :
+     confirmed_reduce_long ? "减仓/止盈" :
+     confirmed_risk_warning ? "风控警戒" :
+     reduce_long_raw and in_position ? "减仓观察" :
+     risk_warning_raw and in_position ? "风险观察" :
+     hold_long ? "继续持有" :
+     "无"
+
+
+// ============================================================================
+// 18. 图上信号
+// ============================================================================
+
+plotshape(show_watch_labels and watch_long and not confirmed_setup_long and not confirmed_long, title="LONG WATCH", style=shape.circle, location=location.belowbar, color=color.new(color.green, 0), text="WATCH", textcolor=color.white, size=size.tiny)
+
+plotshape(show_setup_labels and confirmed_setup_long and not confirmed_setup_long[1], title="LONG SETUP", style=shape.labelup, location=location.belowbar, color=color.yellow, text="SETUP\n多", textcolor=color.black, size=size.small)
+
+plotshape(show_trade_labels and confirmed_long and not confirmed_long[1], title="LONG INIT", style=shape.labelup, location=location.belowbar, color=color.green, text="LONG\n初买", textcolor=color.white, size=size.normal)
+
+plotshape(show_trade_labels and confirmed_add and not confirmed_add[1], title="ADD", style=shape.labelup, location=location.belowbar, color=color.lime, text="ADD\n加仓", textcolor=color.black, size=size.small)
+
+plotshape(show_reduce_labels and confirmed_reduce_long and not confirmed_reduce_long[1], title="REDUCE", style=shape.labeldown, location=location.abovebar, color=color.orange, text="减仓\n止盈", textcolor=color.white, size=size.small)
+
+plotshape(show_reduce_labels and confirmed_risk_warning and not confirmed_risk_warning[1], title="RISK WARNING", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 0), text="风控\n警戒", textcolor=color.white, size=size.small)
+
+plotshape(show_reduce_labels and confirmed_risk_off_long and not confirmed_risk_off_long[1], title="RISK OFF", style=shape.labeldown, location=location.abovebar, color=color.red, text="风险\n退出", textcolor=color.white, size=size.small)
+
+plotshape(do_not_chase and not do_not_chase[1], title="DO NOT CHASE", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 0), text="不追", textcolor=color.white, size=size.tiny)
+
+plotshape(break_strong_resistance and is_visible_bar, title="突破20K压力", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), text="破压", textcolor=color.white, size=size.tiny)
+
+plotshape(break_strong_support and is_visible_bar, title="跌破20K支撑", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), text="破撑", textcolor=color.white, size=size.tiny)
+
+plotshape(enable_t_plan and t_sell_zone and not t_sell_zone[1], title="T高抛观察", style=shape.labeldown, location=location.abovebar, color=color.orange, text="T高抛", textcolor=color.white, size=size.small)
+
+plotshape(enable_t_plan and t_buyback_zone and not t_buyback_zone[1], title="T低吸观察", style=shape.labelup, location=location.belowbar, color=color.aqua, text="T低吸", textcolor=color.black, size=size.small)
+
+
+// ============================================================================
+// 19. 交易计划线
+// ============================================================================
+
+var line entry_line = na
 var line sl_line = na
-var line tp1_line = na
-var line tp2_line = na
-var line tp3_line = na
+var line t1_line = na
+var line t2_line = na
 
+var label entry_label = na
 var label sl_label = na
-var label tp1_label = na
-var label tp2_label = na
-var label tp3_label = na
+var label t1_label = na
+var label t2_label = na
 
-if barstate.islast and show_risk_lines
-    if na(sl_line)
-        sl_line := line.new(bar_index, sl_price, bar_index + 20, sl_price, color=color.red, width=2, style=line.style_dashed)
-        tp1_line := line.new(bar_index, tp1_price, bar_index + 20, tp1_price, color=color.green, width=1, style=line.style_dashed)
-        tp2_line := line.new(bar_index, tp2_price, bar_index + 20, tp2_price, color=color.lime, width=1, style=line.style_dashed)
-        tp3_line := line.new(bar_index, tp3_price, bar_index + 20, tp3_price, color=color.aqua, width=1, style=line.style_dashed)
+if is_panel_bar and show_trade_plan_lines and not na(plan_entry) and not na(plan_sl) and not na(plan_t1) and not na(plan_t2)
+    if na(entry_line)
+        entry_line := line.new(bar_index, plan_entry, bar_index + 25, plan_entry, color=color.new(color.aqua, 0), width=2, style=line.style_solid)
+        sl_line := line.new(bar_index, plan_sl, bar_index + 25, plan_sl, color=color.red, width=2, style=line.style_dashed)
+        t1_line := line.new(bar_index, plan_t1, bar_index + 25, plan_t1, color=color.green, width=1, style=line.style_dashed)
+        t2_line := line.new(bar_index, plan_t2, bar_index + 25, plan_t2, color=color.lime, width=1, style=line.style_dashed)
 
-        sl_label := label.new(bar_index + 22, sl_price, "", color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-        tp1_label := label.new(bar_index + 22, tp1_price, "", color=color.green, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-        tp2_label := label.new(bar_index + 22, tp2_price, "", color=color.lime, textcolor=color.white, style=label.style_label_left, size=size.tiny)
-        tp3_label := label.new(bar_index + 22, tp3_price, "", color=color.aqua, textcolor=color.black, style=label.style_label_left, size=size.tiny)
+        entry_label := label.new(bar_index + 27, plan_entry, "", color=color.aqua, textcolor=color.black, style=label.style_label_left, size=size.tiny)
+        sl_label := label.new(bar_index + 27, plan_sl, "", color=color.red, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        t1_label := label.new(bar_index + 27, plan_t1, "", color=color.green, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        t2_label := label.new(bar_index + 27, plan_t2, "", color=color.lime, textcolor=color.black, style=label.style_label_left, size=size.tiny)
 
-    line.set_xy1(sl_line, bar_index, sl_price)
-    line.set_xy2(sl_line, bar_index + 20, sl_price)
-    line.set_xy1(tp1_line, bar_index, tp1_price)
-    line.set_xy2(tp1_line, bar_index + 20, tp1_price)
-    line.set_xy1(tp2_line, bar_index, tp2_price)
-    line.set_xy2(tp2_line, bar_index + 20, tp2_price)
-    line.set_xy1(tp3_line, bar_index, tp3_price)
-    line.set_xy2(tp3_line, bar_index + 20, tp3_price)
+    line.set_xy1(entry_line, bar_index, plan_entry)
+    line.set_xy2(entry_line, bar_index + 25, plan_entry)
+    line.set_xy1(sl_line, bar_index, plan_sl)
+    line.set_xy2(sl_line, bar_index + 25, plan_sl)
+    line.set_xy1(t1_line, bar_index, plan_t1)
+    line.set_xy2(t1_line, bar_index + 25, plan_t1)
+    line.set_xy1(t2_line, bar_index, plan_t2)
+    line.set_xy2(t2_line, bar_index + 25, plan_t2)
 
-    label.set_xy(sl_label, bar_index + 22, sl_price)
-    label.set_text(sl_label, "SL: " + str.tostring(sl_price, "#.##"))
-    label.set_xy(tp1_label, bar_index + 22, tp1_price)
-    label.set_text(tp1_label, "T1: " + str.tostring(tp1_price, "#.##"))
-    label.set_xy(tp2_label, bar_index + 22, tp2_price)
-    label.set_text(tp2_label, "T2: " + str.tostring(tp2_price, "#.##"))
-    label.set_xy(tp3_label, bar_index + 22, tp3_price)
-    label.set_text(tp3_label, "T3: " + str.tostring(tp3_price, "#.##"))
+    label.set_xy(entry_label, bar_index + 27, plan_entry)
+    label.set_text(entry_label, "ENTRY: " + str.tostring(plan_entry, format.mintick))
+
+    label.set_xy(sl_label, bar_index + 27, plan_sl)
+    label.set_text(sl_label, "SL: " + str.tostring(plan_sl, format.mintick))
+
+    label.set_xy(t1_label, bar_index + 27, plan_t1)
+    label.set_text(t1_label, "T1: " + str.tostring(plan_t1, format.mintick))
+
+    label.set_xy(t2_label, bar_index + 27, plan_t2)
+    label.set_text(t2_label, "T2: " + str.tostring(plan_t2, format.mintick))
 
 
 // ============================================================================
-// 13. 主信息面板
+// 20. 做T计划线
 // ============================================================================
 
-var table panel = table.new(position=position.bottom_left, columns=2, rows=20, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 50))
+var line t_sell_line = na
+var line t_buy_line = na
+var label t_sell_label = na
+var label t_buy_label = na
 
-if barstate.islast and show_panel
-    table.cell(panel, 0, 0, "策略面板 Pro v2", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
-    table.cell(panel, 1, 0, "实时分析", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
+if is_panel_bar and enable_t_plan and show_t_lines and has_position_input and not na(t_sell_target) and not na(t_buyback_target)
+    if na(t_sell_line)
+        t_sell_line := line.new(bar_index, t_sell_target, bar_index + 25, t_sell_target, color=color.new(color.orange, 0), width=2, style=line.style_dashed)
+        t_buy_line := line.new(bar_index, t_buyback_target, bar_index + 25, t_buyback_target, color=color.new(color.aqua, 0), width=2, style=line.style_dashed)
 
-    score_display = bull_score > bear_score ? str.tostring(bull_score) + "/10 做多" : str.tostring(bear_score) + "/10 做空"
-    score_color = bull_score > bear_score ? color.green : color.red
-    table.cell(panel, 0, 1, "信号评分", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 1, score_display, text_color=score_color, text_size=size.small)
+        t_sell_label := label.new(bar_index + 27, t_sell_target, "", color=color.orange, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        t_buy_label := label.new(bar_index + 27, t_buyback_target, "", color=color.aqua, textcolor=color.black, style=label.style_label_left, size=size.tiny)
 
-    struct_text = struct_dir == 1 ? "上升结构" : struct_dir == -1 ? "下降结构" : "未确认"
+    line.set_xy1(t_sell_line, bar_index, t_sell_target)
+    line.set_xy2(t_sell_line, bar_index + 25, t_sell_target)
+
+    line.set_xy1(t_buy_line, bar_index, t_buyback_target)
+    line.set_xy2(t_buy_line, bar_index + 25, t_buyback_target)
+
+    label.set_xy(t_sell_label, bar_index + 27, t_sell_target)
+    label.set_text(t_sell_label, "T高抛: " + str.tostring(t_sell_target, format.mintick))
+
+    label.set_xy(t_buy_label, bar_index + 27, t_buyback_target)
+    label.set_text(t_buy_label, "T低吸: " + str.tostring(t_buyback_target, format.mintick))
+
+
+// ============================================================================
+// 21. 主信息面板
+// ============================================================================
+
+var table panel = table.new(position=position.bottom_left, columns=2, rows=41, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.new(color.gray, 50))
+
+if is_panel_bar and show_panel
+    table.cell(panel, 0, 0, "交易决策面板 v4.6 做T版", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
+    table.cell(panel, 1, 0, hide_last_n > 0 ? "验证模式 -" + str.tostring(hide_last_n) : signal_mode, text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
+
+    table.cell(panel, 0, 1, "交易状态", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 1, trade_state, text_color=trade_state_color, text_size=size.small)
+
+    table.cell(panel, 0, 2, "建议动作", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 2, action_text, text_color=action_color, text_size=size.small)
+
+    table.cell(panel, 0, 3, "虚拟持仓", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 3, state_text, text_color=in_position ? color.aqua : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 4, "市场方向", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 4, direction_bias, text_color=direction_bias == "多头占优" ? color.green : direction_bias == "转弱/风控" ? color.red : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 5, "多头机会", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 5, buy_type, text_color=confirmed_long or confirmed_add ? color.green : confirmed_setup_long ? color.yellow : hold_long ? color.aqua : watch_long ? color.orange : do_not_chase ? color.orange : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 6, "持仓管理", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 6, manage_type, text_color=confirmed_risk_off_long ? color.red : confirmed_reduce_long or confirmed_risk_warning ? color.orange : hold_long ? color.aqua : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 7, "入场质量", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 7, entry_quality_text, text_color=entry_quality >= 4 ? color.green : entry_quality == 3 ? color.yellow : color.gray, text_size=size.small)
+
+    score_display = str.tostring(bull_score) + "/10 多 | 弱 " + str.tostring(bear_score)
+    score_color = bull_score > bear_score ? color.green : bear_score > bull_score ? color.red : color.gray
+    table.cell(panel, 0, 8, "方向评分", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 8, score_display, text_color=score_color, text_size=size.small)
+
+    table.cell(panel, 0, 9, "入场参考", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 9, na(plan_entry) ? "无" : str.tostring(plan_entry, format.mintick), text_color=na(plan_entry) ? color.gray : color.aqua, text_size=size.small)
+
+    table.cell(panel, 0, 10, "止损/失效", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 10, na(plan_sl) ? "无" : str.tostring(plan_sl, format.mintick), text_color=na(plan_sl) ? color.gray : color.red, text_size=size.small)
+
+    table.cell(panel, 0, 11, "目标1", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 11, na(plan_t1) ? "无" : str.tostring(plan_t1, format.mintick), text_color=na(plan_t1) ? color.gray : color.green, text_size=size.small)
+
+    table.cell(panel, 0, 12, "目标2", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 12, na(plan_t2) ? "无" : str.tostring(plan_t2, format.mintick), text_color=na(plan_t2) ? color.gray : color.lime, text_size=size.small)
+
+    table.cell(panel, 0, 13, "盈亏比", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 13, na(plan_rr) ? "无" : "1:" + str.tostring(plan_rr, "#.##"), text_color=rr_ok ? color.green : rr_soft_ok ? color.orange : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 14, "20K最强支撑", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 14, na(sr_support) ? "无" : str.tostring(sr_support, format.mintick) + " x" + str.tostring(sr_support_touches), text_color=na(sr_support) ? color.gray : color.green, text_size=size.small)
+
+    table.cell(panel, 0, 15, "20K最强压力", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 15, na(sr_resistance) ? "无" : str.tostring(sr_resistance, format.mintick) + " x" + str.tostring(sr_resistance_touches), text_color=na(sr_resistance) ? color.gray : color.red, text_size=size.small)
+
+    table.cell(panel, 0, 16, "20K位置", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 16, sr_position, text_color=near_strong_support or break_strong_resistance or near_flipped_support ? color.green : near_strong_resistance or break_strong_support or near_flipped_resistance ? color.red : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 17, "支撑质量", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 17, na(sr_support) ? "无" : str.tostring(sr_support_quality) + "/5 反应" + str.tostring(sr_support_reaction), text_color=sr_support_quality >= 3 ? color.green : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 18, "压力质量", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 18, na(sr_resistance) ? "无" : str.tostring(sr_resistance_quality) + "/5 反应" + str.tostring(sr_resistance_reaction), text_color=sr_resistance_quality >= 3 ? color.red : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 19, "日线趋势", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 19, d_trend, text_color=d_bull ? color.green : color.red, text_size=size.small)
+
+    table.cell(panel, 0, 20, "周线趋势", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 20, w_trend, text_color=w_bull ? color.green : color.red, text_size=size.small)
+
+    table.cell(panel, 0, 21, "月线趋势", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 21, m_trend, text_color=m_bull ? color.green : color.red, text_size=size.small)
+
+    align_text = all_bull_aligned ? "全面做多" : all_bear_aligned ? "全面偏弱" : "分歧"
+    align_color = all_bull_aligned ? color.green : all_bear_aligned ? color.red : color.yellow
+    table.cell(panel, 0, 22, "多周期对齐", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 22, align_text, text_color=align_color, text_size=size.small)
+
+    struct_text = struct_dir == 1 ? "上升结构" : struct_dir == -1 ? "下降/转弱结构" : "未确认"
     struct_color = struct_dir == 1 ? color.green : struct_dir == -1 ? color.red : color.gray
-    table.cell(panel, 0, 2, "市场结构", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 2, struct_text, text_color=struct_color, text_size=size.small)
+    table.cell(panel, 0, 23, "市场结构", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 23, struct_text, text_color=struct_color, text_size=size.small)
 
     cloud_text = price_above_cloud ? "云上" : price_below_cloud ? "云下" : in_the_cloud ? "云中" : "无数据"
     cloud_color = price_above_cloud ? color.green : price_below_cloud ? color.red : color.yellow
-    table.cell(panel, 0, 3, "一目位置", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 3, cloud_text, text_color=cloud_color, text_size=size.small)
-
-    table.cell(panel, 0, 4, "入场参考", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 4, str.tostring(entry_price, "#.##"), text_color=#00FFFF, text_size=size.small)
-
-    table.cell(panel, 0, 5, "止损位 ATR", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 5, str.tostring(sl_price, "#.##"), text_color=color.red, text_size=size.small)
-
-    table.cell(panel, 0, 6, "目标1 T1", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 6, str.tostring(tp1_price, "#.##"), text_color=color.green, text_size=size.small)
-
-    table.cell(panel, 0, 7, "目标2 T2", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 7, str.tostring(tp2_price, "#.##"), text_color=color.green, text_size=size.small)
-
-    table.cell(panel, 0, 8, "目标3 T3", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 8, str.tostring(tp3_price, "#.##"), text_color=color.lime, text_size=size.small)
-
-    table.cell(panel, 0, 9, "风险回报比", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 9, "1:" + str.tostring(rr_ratio, "#.##"), text_color=rr_ratio >= 2 ? color.green : color.orange, text_size=size.small)
-
-    table.cell(panel, 0, 10, "日线趋势 D", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 10, d_trend, text_color=d_bull ? color.green : color.red, text_size=size.small)
-
-    table.cell(panel, 0, 11, "周线趋势 W", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 11, w_trend, text_color=w_bull ? color.green : color.red, text_size=size.small)
-
-    table.cell(panel, 0, 12, "月线趋势 M", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 12, m_trend, text_color=m_bull ? color.green : color.red, text_size=size.small)
-
-    align_text = all_bull_aligned ? "全面做多" : all_bear_aligned ? "全面做空" : "分歧"
-    align_color = all_bull_aligned ? color.green : all_bear_aligned ? color.red : color.yellow
-    table.cell(panel, 0, 13, "多周期对齐", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 13, align_text, text_color=align_color, text_size=size.small)
+    table.cell(panel, 0, 24, "一目位置", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 24, cloud_text, text_color=cloud_color, text_size=size.small)
 
     rsi_status = rsi_val > rsi_ob ? "超买" : rsi_val < rsi_os ? "超卖" : rsi_val > 50 ? "偏强" : "偏弱"
     rsi_color = rsi_val > rsi_ob ? color.red : rsi_val < rsi_os ? color.green : rsi_val > 50 ? color.green : color.orange
-    table.cell(panel, 0, 14, "RSI(" + str.tostring(rsi_len) + ")", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 14, str.tostring(rsi_val, "#.#") + " " + rsi_status, text_color=rsi_color, text_size=size.small)
+    table.cell(panel, 0, 25, "RSI", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 25, str.tostring(rsi_val, "#.#") + " " + rsi_status, text_color=rsi_color, text_size=size.small)
 
-    macd_status = macd_bull ? "金叉" : "死叉"
-    macd_color = macd_bull ? color.green : color.red
-    table.cell(panel, 0, 15, "MACD", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 15, macd_status, text_color=macd_color, text_size=size.small)
+    adx_text = adx_val >= min_adx ? "趋势可用 " + str.tostring(adx_val, "#.#") : "趋势不足 " + str.tostring(adx_val, "#.#")
+    table.cell(panel, 0, 26, "ADX", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 26, adx_text, text_color=adx_val >= min_adx ? color.green : color.gray, text_size=size.small)
 
-    adx_text = adx_val > 25 ? "强趋势 " + str.tostring(adx_val, "#.#") : "弱趋势 " + str.tostring(adx_val, "#.#")
-    table.cell(panel, 0, 16, "ADX 趋势力", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 16, adx_text, text_color=adx_val > 25 ? color.green : color.gray, text_size=size.small)
+    table.cell(panel, 0, 27, "ATR%", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 27, str.tostring(atr_pct, "#.##") + "%", text_color=atr_ok ? color.green : color.gray, text_size=size.small)
 
-    sq_text = is_squeeze ? "挤压中" : "正常波动"
-    table.cell(panel, 0, 17, "Squeeze", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 17, sq_text, text_color=is_squeeze ? color.yellow : color.gray, text_size=size.small)
+    vol_status = volume > vol_ma * 2.0 ? "巨量" : volume > vol_ma * 1.3 ? "放量" : volume < vol_ma * 0.6 ? "缩量" : "正常"
+    vol_color = volume > vol_ma * 1.3 ? color.orange : volume < vol_ma * 0.6 ? color.gray : color.white
+    table.cell(panel, 0, 28, "成交量", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 28, vol_status, text_color=vol_color, text_size=size.small)
 
-    vol_status = volume > vol_ma20 * 2.0 ? "巨量" : volume > vol_ma20 * 1.5 ? "放量" : volume < vol_ma20 * 0.5 ? "极度缩量" : "正常"
-    vol_color = volume > vol_ma20 * 1.5 ? color.orange : volume < vol_ma20 * 0.5 ? color.gray : color.white
-    table.cell(panel, 0, 18, "成交量", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 18, vol_status, text_color=vol_color, text_size=size.small)
+    location_text =
+         near_flipped_support ? "前压力转支撑" :
+         near_flipped_resistance ? "前支撑转压力" :
+         near_strong_support ? "20K强支撑" :
+         near_strong_resistance ? "20K强压力" :
+         near_bull_ob ? "回踩多头OB" :
+         near_bull_fvg ? "回踩多头FVG" :
+         near_pressure_ob ? "压力OB" :
+         near_pressure_fvg ? "压力FVG" :
+         sweep_low ? "扫低收回" :
+         sweep_high ? "扫高回落" :
+         "普通位置"
+    location_color = near_flipped_support or near_strong_support or near_bull_ob or near_bull_fvg or sweep_low ? color.green : near_flipped_resistance or near_strong_resistance or near_pressure_ob or near_pressure_fvg or sweep_high ? color.red : color.gray
+    table.cell(panel, 0, 29, "位置", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 29, location_text, text_color=location_color, text_size=size.small)
 
-    vwap_text = use_vwap ? (vwap_bias == 1 ? "VWAP上方" : vwap_bias == -1 ? "VWAP下方" : "VWAP附近") : "非日内不启用"
-    vwap_color = use_vwap ? (vwap_bias == 1 ? color.green : vwap_bias == -1 ? color.red : color.gray) : color.gray
-    table.cell(panel, 0, 19, "VWAP状态", text_color=color.white, text_size=size.small)
-    table.cell(panel, 1, 19, vwap_text, text_color=vwap_color, text_size=size.small)
+    filter_text =
+         chop_market ? "CHOP盘整" :
+         price_too_extended ? "过度延伸" :
+         "可观察"
+    filter_color =
+         chop_market ? color.gray :
+         price_too_extended ? color.orange :
+         color.green
+    table.cell(panel, 0, 30, "过滤状态", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 30, filter_text, text_color=filter_color, text_size=size.small)
+
+    table.cell(panel, 0, 31, "动态阈值", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 31, "分" + str.tostring(min_dir_score) + " ADX" + str.tostring(min_adx, "#.#"), text_color=color.aqua, text_size=size.small)
+
+    table.cell(panel, 0, 32, "冷却状态", text_color=color.white, text_size=size.small)
+    cool_text = "L" + (can_long ? "✓" : "×") + " A" + (can_add ? "✓" : "×") + " R" + (can_reduce ? "✓" : "×")
+    table.cell(panel, 1, 32, cool_text, text_color=color.aqua, text_size=size.small)
+
+    table.cell(panel, 0, 33, "SR评分加成", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 33, sr_quality_bonus == 1 ? "已加分" : "无", text_color=sr_quality_bonus == 1 ? color.green : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 34, "持仓盈亏", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 34, has_position_input ? str.tostring(position_pnl, "#.##") + " / " + str.tostring(position_pnl_pct, "#.##") + "%" : "未输入", text_color=has_position_input ? position_pnl >= 0 ? color.green : color.red : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 35, "T高抛目标", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 35, enable_t_plan and has_position_input ? str.tostring(t_sell_target, format.mintick) : "无", text_color=color.orange, text_size=size.small)
+
+    table.cell(panel, 0, 36, "T低吸目标", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 36, enable_t_plan and has_position_input ? str.tostring(t_buyback_target, format.mintick) : "无", text_color=color.aqua, text_size=size.small)
+
+    table.cell(panel, 0, 37, "T理论空间", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 37, enable_t_plan and has_position_input and not na(t_space_pct) ? str.tostring(t_space_pct, "#.##") + "%" : "无", text_color=t_space_ok ? color.green : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 38, "T预估收益", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 38, enable_t_plan and has_position_input and not na(t_net_profit) ? str.tostring(t_net_profit, "#.##") : "无", text_color=t_net_profit > 0 ? color.green : color.gray, text_size=size.small)
+
+    table.cell(panel, 0, 39, "做T状态", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 39, t_status, text_color=t_sell_zone ? color.orange : t_buyback_zone ? color.aqua : t_space_ok ? color.green : color.gray, text_size=size.small)
+
+    final_msg =
+         confirmed_long ? "初买信号确认" :
+         confirmed_add ? "加仓信号确认" :
+         confirmed_risk_off_long ? "多单风险退出" :
+         confirmed_reduce_long ? "减仓/止盈提示" :
+         confirmed_risk_warning ? "风控警戒" :
+         confirmed_setup_long ? "多头结构形成" :
+         hold_long ? "趋势持有，不追高" :
+         watch_long ? "多头观察点" :
+         do_not_chase ? "过度延伸，不追高" :
+         chop_market ? "盘整过滤，不交易" :
+         "无交易机会"
+    final_color =
+         confirmed_long or confirmed_add ? color.green :
+         confirmed_risk_off_long ? color.red :
+         confirmed_reduce_long or confirmed_risk_warning or do_not_chase ? color.orange :
+         confirmed_setup_long ? color.yellow :
+         hold_long ? color.aqua :
+         watch_long ? color.orange :
+         color.gray
+    table.cell(panel, 0, 40, "信号结论", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 40, final_msg, text_color=final_color, text_size=size.small)
 
 
 // ============================================================================
-// 14. 看图顺序提示面板
+// 22. 看图顺序提示面板
 // ============================================================================
 
-var table guide_panel = table.new(position=position.bottom_right, columns=1, rows=12, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
+var table guide_panel = table.new(position=position.bottom_right, columns=1, rows=13, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
 
-if barstate.islast and show_guide
-    table.cell(guide_panel, 0, 0, "看图顺序提示", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
-    table.cell(guide_panel, 0, 1, "1. 先看日/周/月趋势", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 2, "2. 看多周期是否对齐", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 3, "3. 看价格相对一目均衡表云层", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 4, "4. 看价格在云上/云中/云下", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 5, "5. 看评分与结构方向", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 6, "6. 看BOS / OB / FVG", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 7, "7. 看MACD / RSI / ADX", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 8, "8. 看Squeeze与成交量", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 9, "9. 等回踩确认再进场", text_color=color.white, text_size=size.tiny)
-    table.cell(guide_panel, 0, 10, "10. 不逆大周期重仓", text_color=color.orange, text_size=size.tiny)
-    table.cell(guide_panel, 0, 11, "原则: 方向 > 结构 > 位置 > 信号 > 风控", text_color=color.aqua, text_size=size.tiny)
+if is_panel_bar and show_guide
+    table.cell(guide_panel, 0, 0, "看图顺序 v4.6 做T版", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 20))
+    table.cell(guide_panel, 0, 1, "1. 本版不做空，只做多头与持仓管理", text_color=color.aqua, text_size=size.tiny)
+    table.cell(guide_panel, 0, 2, "2. 先看20K支撑/压力质量", text_color=color.white, text_size=size.tiny)
+    table.cell(guide_panel, 0, 3, "3. 支撑质量≥3才作为有效买点位置", text_color=color.lime, text_size=size.tiny)
+    table.cell(guide_panel, 0, 4, "4. 突破压力需放量确认", text_color=color.lime, text_size=size.tiny)
+    table.cell(guide_panel, 0, 5, "5. LONG初买：空仓后的执行买点", text_color=color.lime, text_size=size.tiny)
+    table.cell(guide_panel, 0, 6, "6. ADD加仓：持仓后的健康回踩", text_color=color.lime, text_size=size.tiny)
+    table.cell(guide_panel, 0, 7, "7. HOLD：趋势好，但不追高", text_color=color.aqua, text_size=size.tiny)
+    table.cell(guide_panel, 0, 8, "8. REDUCE：压力区/扫高/熊背离", text_color=color.orange, text_size=size.tiny)
+    table.cell(guide_panel, 0, 9, "9. RISK OFF：跌破支撑/MA50/结构破位", text_color=color.red, text_size=size.tiny)
+    table.cell(guide_panel, 0, 10, "10. 做T只作价格计划辅助", text_color=color.orange, text_size=size.tiny)
+    table.cell(guide_panel, 0, 11, "11. A股做T通常基于已有底仓", text_color=color.aqua, text_size=size.tiny)
+    table.cell(guide_panel, 0, 12, "原则：支撑买，压力减，有空间才T", text_color=color.aqua, text_size=size.tiny)
 
 
 // ============================================================================
-// 15. 警报条件
+// 23. 警报条件
 // ============================================================================
 
-alertcondition(signal_bull and not signal_bull[1], title="BUY信号(趋势+回踩)", message="策略面板 Pro v2: 趋势内回踩确认做多")
-alertcondition(signal_bear and not signal_bear[1], title="SELL信号(趋势+回踩)", message="策略面板 Pro v2: 趋势内回踩确认做空")
+alertcondition(watch_long, title="LONG WATCH", message="v4.6: 多头观察点出现")
+alertcondition(confirmed_setup_long and not confirmed_setup_long[1], title="LONG SETUP", message="v4.6: 多头结构形成")
+alertcondition(confirmed_long and not confirmed_long[1], title="LONG INIT", message="v4.6: 初次建仓信号确认")
+alertcondition(confirmed_add and not confirmed_add[1], title="ADD", message="v4.6: 趋势加仓信号确认")
+alertcondition(hold_long, title="HOLD", message="v4.6: 趋势持有状态")
+alertcondition(do_not_chase and not do_not_chase[1], title="DO NOT CHASE", message="v4.6: 价格过度延伸，不追高")
 
-alertcondition(bear_div_confirmed, title="确认熊背离", message="策略面板 Pro v2: 检测到确认熊背离，注意风险")
-alertcondition(bull_div_confirmed, title="确认牛背离", message="策略面板 Pro v2: 检测到确认牛背离，关注反弹")
+alertcondition(confirmed_reduce_long and not confirmed_reduce_long[1], title="REDUCE / TAKE PROFIT", message="v4.6: 减仓/止盈提示")
+alertcondition(confirmed_risk_warning and not confirmed_risk_warning[1], title="RISK WARNING", message="v4.6: 风控警戒")
+alertcondition(confirmed_risk_off_long and not confirmed_risk_off_long[1], title="RISK OFF", message="v4.6: 风险退出提示")
 
-alertcondition(is_squeeze and not is_squeeze[1], title="进入挤压", message="策略面板 Pro v2: 布林带挤压开始，准备方向选择")
+alertcondition(enable_t_plan and t_sell_zone and not t_sell_zone[1], title="T高抛观察", message="v4.6: 到达或接近T高抛观察区")
+alertcondition(enable_t_plan and t_buyback_zone and not t_buyback_zone[1], title="T低吸观察", message="v4.6: 到达或接近T低吸观察区")
 
-alertcondition(bos_bullish, title="多头结构突破", message="策略面板 Pro v2: 多头结构突破 BOS")
-alertcondition(bos_bearish, title="空头结构突破", message="策略面板 Pro v2: 空头结构突破 BOS")
+alertcondition(break_strong_resistance, title="突破20K最强压力", message="v4.6: 突破最近N根K线最强压力区")
+alertcondition(break_strong_support, title="跌破20K最强支撑", message="v4.6: 跌破最近N根K线最强支撑区")
+alertcondition(near_strong_support, title="靠近20K最强支撑", message="v4.6: 价格靠近最近N根K线最强支撑区")
+alertcondition(near_strong_resistance, title="靠近20K最强压力", message="v4.6: 价格靠近最近N根K线最强压力区")
 
-alertcondition(all_bull_aligned and not all_bull_aligned[1], title="多周期做多对齐", message="策略面板 Pro v2: 日/周/月多头对齐")
-alertcondition(all_bear_aligned and not all_bear_aligned[1], title="多周期做空对齐", message="策略面板 Pro v2: 日/周/月空头对齐")
+alertcondition(sweep_low, title="扫低收回", message="v4.6: 出现流动性扫低收回")
+alertcondition(sweep_high, title="扫高回落", message="v4.6: 出现流动性扫高回落")
 
-alertcondition(bull_fvg, title="看涨FVG出现", message="策略面板 Pro v2: 出现看涨FVG，等待回踩")
-alertcondition(bear_fvg, title="看跌FVG出现", message="策略面板 Pro v2: 出现看跌FVG，等待回踩")
+alertcondition(bos_bullish, title="多头BOS", message="v4.6: 多头结构突破 BOS")
+alertcondition(choch_bullish, title="多头CHoCH", message="v4.6: 多头结构转换 CHoCH")
+alertcondition(bos_bearish, title="破位风险", message="v4.6: 出现结构破位风险")
+alertcondition(choch_bearish, title="转弱风险", message="v4.6: 出现结构转弱风险")
+
+alertcondition(bull_div_confirmed, title="确认牛背离", message="v4.6: 确认牛背离")
+alertcondition(bear_div_confirmed, title="确认熊背离", message="v4.6: 确认熊背离，注意减仓")
+alertcondition(is_squeeze and not is_squeeze[1], title="进入挤压", message="v4.6: 布林带挤压开始，等待方向选择")
 
 // ============================================================================
 // END
