@@ -1847,3 +1847,474 @@ alertcondition(is_squeeze and not is_squeeze[1], title="进入挤压", message="
 // ============================================================================
 // END
 // ============================================================================
+
+
+
+// ============================================================================
+// 24. 🇭🇰 港股通腾讯专属模块 (HK Port-Trade Module v1.0)
+// ----------------------------------------------------------------------------
+// 设计目标：
+//   1) 实时监控 4000 股腾讯持仓盈亏（Core 3000 不动 + Tactical 浮仓做 T）
+//   2) 港股通双向 0.30% 摩擦精算下的做 T 信号触发与盈亏平衡测算
+//   3) 做 T 配对状态机：累计循环数 / 净利 / 平均价差 / 单股降本
+//   4) 金字塔加仓区 (Z1/Z2/Z3) + 阶梯止盈线 (600/650/700) 可视化
+//   5) 独立 HK 综合仪表盘 + 专属警报
+// 完全独立模块，可通过 enable_hk_module 关闭，不影响原 v4.6 状态机
+// ============================================================================
+
+grp_hk = "🇭🇰 港股通腾讯模块"
+enable_hk_module    = input.bool(true,   "启用港股通腾讯模块",            group=grp_hk)
+hk_show_dashboard   = input.bool(true,   "显示HK综合仪表盘",              group=grp_hk)
+hk_show_zones       = input.bool(true,   "显示加仓区/止盈线",             group=grp_hk)
+hk_show_signals     = input.bool(true,   "显示HK做T信号箭头",             group=grp_hk)
+
+grp_hk_pos = "🇭🇰 持仓配置"
+hk_core_qty         = input.int(3000,    "核心底仓股数 (绝不动)",         minval=0, step=100, group=grp_hk_pos)
+hk_tactical_qty     = input.int(1000,    "战术浮仓股数 (做T用)",          minval=0, step=100, group=grp_hk_pos)
+hk_avg_cost_hkd     = input.float(435.0, "持仓平均成本 (HKD口径)",        minval=0.01, step=0.5, group=grp_hk_pos)
+
+grp_hk_fee = "🇭🇰 港股通费率精算"
+hk_friction_pct     = input.float(0.30,  "双向综合摩擦率%",               minval=0.05, step=0.01, group=grp_hk_fee)
+hk_min_spread_pct   = input.float(2.5,   "做T最低有效价差% (覆盖摩擦)",   minval=0.5,  step=0.1,  group=grp_hk_fee)
+hk_target_spread_pct = input.float(4.0,  "做T理想目标价差%",              minval=1.0,  step=0.1,  group=grp_hk_fee)
+
+grp_hk_target = "🇭🇰 远期阶梯止盈"
+hk_target_t1        = input.float(600.0, "止盈 Tier 1 (HKD)",             minval=1.0, step=1.0, group=grp_hk_target)
+hk_target_t2        = input.float(650.0, "止盈 Tier 2 (HKD)",             minval=1.0, step=1.0, group=grp_hk_target)
+hk_target_t3        = input.float(700.0, "止盈 Tier 3 (HKD)",             minval=1.0, step=1.0, group=grp_hk_target)
+
+grp_hk_pyr = "🇭🇰 金字塔加仓区"
+hk_z1_low           = input.float(444.0, "Z1 浅回试 下沿",                minval=1.0, group=grp_hk_pyr)
+hk_z1_high          = input.float(450.0, "Z1 浅回试 上沿",                minval=1.0, group=grp_hk_pyr)
+hk_z2_low           = input.float(425.0, "Z2 中度回踩 下沿",              minval=1.0, group=grp_hk_pyr)
+hk_z2_high          = input.float(443.0, "Z2 中度回踩 上沿",              minval=1.0, group=grp_hk_pyr)
+hk_z3_low           = input.float(405.0, "Z3 深度承接 下沿",              minval=1.0, group=grp_hk_pyr)
+hk_z3_high          = input.float(424.0, "Z3 深度承接 上沿",              minval=1.0, group=grp_hk_pyr)
+
+grp_hk_sig = "🇭🇰 信号阈值"
+hk_emadev_high      = input.float(4.0,   "高抛-EMA20正偏离%",             minval=0.5, step=0.1, group=grp_hk_sig)
+hk_rsi_high         = input.float(65.0,  "高抛-RSI阈值",                  minval=50.0, step=1.0, group=grp_hk_sig)
+hk_rsi_low          = input.float(35.0,  "低吸-RSI阈值",                  minval=20.0, step=1.0, group=grp_hk_sig)
+hk_min_score        = input.int(3,       "信号触发最低分(共5分)",         minval=2, maxval=5, group=grp_hk_sig)
+hk_pair_log_max     = input.int(20,      "做T配对历史保留条数",           minval=5, maxval=50, group=grp_hk_sig)
+
+
+// ----------------------------------------------------------------------------
+// 24.1 基础变量与开关
+// ----------------------------------------------------------------------------
+
+hk_total_qty = hk_core_qty + hk_tactical_qty
+hk_active = enable_hk_module and hk_total_qty > 0 and hk_avg_cost_hkd > 0
+
+// 摩擦成本 (HKD)
+hk_min_breakeven_hkd = close * hk_friction_pct / 100.0          // 单股盈亏平衡价差
+hk_min_useful_hkd    = close * hk_min_spread_pct / 100.0         // 单股最低有效价差
+hk_target_useful_hkd = close * hk_target_spread_pct / 100.0      // 单股理想价差
+hk_t_qty_eff = hk_tactical_qty                                   // 单次做T的股数
+
+hk_single_t_breakeven_value = hk_min_breakeven_hkd * hk_t_qty_eff
+hk_single_t_min_profit      = hk_min_useful_hkd * hk_t_qty_eff
+hk_single_t_target_profit   = hk_target_useful_hkd * hk_t_qty_eff
+
+
+// ----------------------------------------------------------------------------
+// 24.2 持仓盈亏与目标距离
+// ----------------------------------------------------------------------------
+
+hk_pnl       = (close - hk_avg_cost_hkd) * hk_total_qty
+hk_pnl_pct   = (close - hk_avg_cost_hkd) / hk_avg_cost_hkd * 100.0
+hk_mkt_value = close * hk_total_qty
+
+hk_to_t1_pct = (hk_target_t1 - close) / close * 100.0
+hk_to_t2_pct = (hk_target_t2 - close) / close * 100.0
+hk_to_t3_pct = (hk_target_t3 - close) / close * 100.0
+
+// 触及目标时的潜在已实现收益（按比例 Tier1=21% / Tier2=26% / Tier3=21% / 留 32% 奔跑仓）
+hk_t1_qty = math.round(hk_total_qty * 0.21 / 100.0) * 100
+hk_t2_qty = math.round(hk_total_qty * 0.26 / 100.0) * 100
+hk_t3_qty = math.round(hk_total_qty * 0.21 / 100.0) * 100
+hk_runner_qty = hk_total_qty - hk_t1_qty - hk_t2_qty - hk_t3_qty
+
+hk_t1_realize = (hk_target_t1 - hk_avg_cost_hkd) * hk_t1_qty
+hk_t2_realize = (hk_target_t2 - hk_avg_cost_hkd) * hk_t2_qty
+hk_t3_realize = (hk_target_t3 - hk_avg_cost_hkd) * hk_t3_qty
+
+
+// ----------------------------------------------------------------------------
+// 24.3 多条件信号评分（5 选 N，可调阈值）
+// ----------------------------------------------------------------------------
+
+// ===== 高抛子条件 =====
+hk_sell_c1_bb      = high >= bb_upper                                                      // BB上轨触及
+hk_sell_c2_rsi     = rsi_val > hk_rsi_high                                                 // RSI超买
+hk_sell_c3_emadev  = ((close - ma20) / ma20 * 100.0) >= hk_emadev_high                     // EMA20正偏离
+hk_sell_c4_volwarn = (volume < vol_ma * 1.2) and (close > open)                            // 上涨乏量
+hk_sell_c5_pattern = bear_div_confirmed or upper_reject or sweep_high or is_shooting_star  // 顶部信号
+
+hk_sell_score =
+     (hk_sell_c1_bb ? 1 : 0) +
+     (hk_sell_c2_rsi ? 1 : 0) +
+     (hk_sell_c3_emadev ? 1 : 0) +
+     (hk_sell_c4_volwarn ? 1 : 0) +
+     (hk_sell_c5_pattern ? 1 : 0)
+
+hk_sell_t_signal = hk_active and bar_confirmed and hk_sell_score >= hk_min_score
+
+// ===== 低吸子条件 =====
+hk_buy_c1_bb       = low <= bb_lower                                                       // BB下轨触及
+hk_buy_c2_rsi      = rsi_val < hk_rsi_low                                                  // RSI超卖
+hk_buy_c3_emaback  = (math.abs(close - ma50) / ma50 * 100.0) <= 1.5 or (math.abs(close - ma100) / ma100 * 100.0) <= 1.5  // EMA50/100回踩
+hk_buy_c4_pattern  = bull_div_confirmed or sweep_low or is_hammer or bull_engulf           // 底部信号
+hk_buy_c5_zone     = (low <= hk_z1_high and high >= hk_z1_low) or (low <= hk_z2_high and high >= hk_z2_low) or (low <= hk_z3_high and high >= hk_z3_low)  // 进入加仓区
+
+hk_buy_score =
+     (hk_buy_c1_bb ? 1 : 0) +
+     (hk_buy_c2_rsi ? 1 : 0) +
+     (hk_buy_c3_emaback ? 1 : 0) +
+     (hk_buy_c4_pattern ? 1 : 0) +
+     (hk_buy_c5_zone ? 1 : 0)
+
+hk_buy_t_signal = hk_active and bar_confirmed and hk_buy_score >= hk_min_score
+
+
+// ----------------------------------------------------------------------------
+// 24.4 做T配对状态机（先卖后买，浮仓循环）
+// ----------------------------------------------------------------------------
+
+var float hk_t_open_price       = na     // 当前开仓的高抛价（已卖出待回补）
+var int   hk_t_open_bar         = na
+var int   hk_pairs_total        = 0      // 总配对次数（含亏损）
+var int   hk_pairs_win          = 0      // 盈利配对次数
+var float hk_cum_t_net_profit   = 0.0    // 累计净利
+var float hk_cum_friction_cost  = 0.0    // 累计摩擦支出
+var float hk_max_pair_profit    = 0.0    // 单次最大盈利
+var float hk_min_pair_profit    = 0.0    // 单次最大亏损（带负号）
+var array<float> hk_pair_profits = array.new<float>()
+var array<float> hk_pair_spreads = array.new<float>()
+var int   hk_t_holding_bars     = 0      // 浮仓持有K线数（卖出后等待回补）
+
+// 持仓时长更新
+if hk_active and not na(hk_t_open_price)
+    hk_t_holding_bars := bar_index - hk_t_open_bar
+
+// 高抛触发：开仓 (sell first) — 仅在无 open T 时触发
+if hk_active and hk_sell_t_signal and na(hk_t_open_price)
+    hk_t_open_price := close
+    hk_t_open_bar := bar_index
+
+// 低吸触发：平仓配对 (buy back)
+if hk_active and hk_buy_t_signal and not na(hk_t_open_price)
+    spread_hkd     = hk_t_open_price - close
+    spread_pct_loc = spread_hkd / hk_t_open_price * 100.0
+    gross          = spread_hkd * hk_t_qty_eff
+    friction       = (hk_t_open_price + close) * hk_t_qty_eff * hk_friction_pct / 100.0 / 2.0
+    net            = gross - friction
+
+    hk_pairs_total      := hk_pairs_total + 1
+    hk_cum_friction_cost := hk_cum_friction_cost + friction
+    hk_cum_t_net_profit := hk_cum_t_net_profit + net
+    if net > 0
+        hk_pairs_win := hk_pairs_win + 1
+    hk_max_pair_profit := math.max(hk_max_pair_profit, net)
+    hk_min_pair_profit := math.min(hk_min_pair_profit, net)
+
+    array.push(hk_pair_profits, net)
+    array.push(hk_pair_spreads, spread_pct_loc)
+    if array.size(hk_pair_profits) > hk_pair_log_max
+        array.shift(hk_pair_profits)
+        array.shift(hk_pair_spreads)
+
+    // 重置 T 状态
+    hk_t_open_price := na
+    hk_t_open_bar := na
+
+// 衍生统计
+hk_avg_pair_spread = array.size(hk_pair_spreads) > 0 ? array.avg(hk_pair_spreads) : 0.0
+hk_avg_pair_profit = array.size(hk_pair_profits) > 0 ? array.avg(hk_pair_profits) : 0.0
+hk_win_rate = hk_pairs_total > 0 ? hk_pairs_win / hk_pairs_total * 100.0 : 0.0
+hk_cost_reduction_per_share = hk_total_qty > 0 ? hk_cum_t_net_profit / hk_total_qty : 0.0
+hk_effective_new_cost = hk_avg_cost_hkd - hk_cost_reduction_per_share
+
+
+// ----------------------------------------------------------------------------
+// 24.5 加仓区位置识别
+// ----------------------------------------------------------------------------
+
+hk_in_z1 = close >= hk_z1_low and close <= hk_z1_high
+hk_in_z2 = close >= hk_z2_low and close <= hk_z2_high
+hk_in_z3 = close >= hk_z3_low and close <= hk_z3_high
+hk_below_z3 = close < hk_z3_low
+hk_above_z1 = close > hk_z1_high
+
+
+// ----------------------------------------------------------------------------
+// 24.6 绘制止盈线 / 加仓区 / 信号箭头
+// ----------------------------------------------------------------------------
+// 注意：使用 line.new()/box.new() 替代 plot()，避免触及 indicator 64 个 plot 上限
+// line/box 对象只在 is_panel_bar (最新K线) 创建一次并向右延伸
+
+var line  hk_line_t1     = na
+var line  hk_line_t2     = na
+var line  hk_line_t3     = na
+var line  hk_line_cost   = na
+var line  hk_line_newcost = na
+var box   hk_box_z1      = na
+var box   hk_box_z2      = na
+var box   hk_box_z3      = na
+var label hk_lbl_t1      = na
+var label hk_lbl_t2      = na
+var label hk_lbl_t3      = na
+var label hk_lbl_cost    = na
+var label hk_lbl_newcost = na
+var label hk_lbl_z1      = na
+var label hk_lbl_z2      = na
+var label hk_lbl_z3      = na
+
+hk_extend_right = 30
+hk_extend_left  = 50
+
+if is_panel_bar and hk_show_zones and hk_active
+    int x1 = bar_index - hk_extend_left
+    int x2 = bar_index + hk_extend_right
+    int xl = bar_index + hk_extend_right + 2
+
+    // ===== 止盈线 T1 (600) =====
+    if na(hk_line_t1)
+        hk_line_t1 := line.new(x1, hk_target_t1, x2, hk_target_t1, color=color.new(color.lime, 30), width=2, style=line.style_dotted)
+        hk_lbl_t1  := label.new(xl, hk_target_t1, "", color=color.new(color.lime, 0), textcolor=color.black, style=label.style_label_left, size=size.tiny)
+    line.set_xy1(hk_line_t1, x1, hk_target_t1)
+    line.set_xy2(hk_line_t1, x2, hk_target_t1)
+    label.set_xy(hk_lbl_t1, xl, hk_target_t1)
+    label.set_text(hk_lbl_t1, "T1 " + str.tostring(hk_target_t1, "#"))
+
+    // ===== 止盈线 T2 (650) =====
+    if na(hk_line_t2)
+        hk_line_t2 := line.new(x1, hk_target_t2, x2, hk_target_t2, color=color.new(color.green, 20), width=2, style=line.style_dotted)
+        hk_lbl_t2  := label.new(xl, hk_target_t2, "", color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    line.set_xy1(hk_line_t2, x1, hk_target_t2)
+    line.set_xy2(hk_line_t2, x2, hk_target_t2)
+    label.set_xy(hk_lbl_t2, xl, hk_target_t2)
+    label.set_text(hk_lbl_t2, "T2 " + str.tostring(hk_target_t2, "#"))
+
+    // ===== 止盈线 T3 (700) =====
+    if na(hk_line_t3)
+        hk_line_t3 := line.new(x1, hk_target_t3, x2, hk_target_t3, color=color.new(color.green, 0), width=3, style=line.style_dotted)
+        hk_lbl_t3  := label.new(xl, hk_target_t3, "", color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    line.set_xy1(hk_line_t3, x1, hk_target_t3)
+    line.set_xy2(hk_line_t3, x2, hk_target_t3)
+    label.set_xy(hk_lbl_t3, xl, hk_target_t3)
+    label.set_text(hk_lbl_t3, "T3 " + str.tostring(hk_target_t3, "#"))
+
+    // ===== 持仓成本线 =====
+    if na(hk_line_cost)
+        hk_line_cost := line.new(x1, hk_avg_cost_hkd, x2, hk_avg_cost_hkd, color=color.new(color.yellow, 0), width=2, style=line.style_solid)
+        hk_lbl_cost  := label.new(xl, hk_avg_cost_hkd, "", color=color.new(color.yellow, 0), textcolor=color.black, style=label.style_label_left, size=size.tiny)
+    line.set_xy1(hk_line_cost, x1, hk_avg_cost_hkd)
+    line.set_xy2(hk_line_cost, x2, hk_avg_cost_hkd)
+    label.set_xy(hk_lbl_cost, xl, hk_avg_cost_hkd)
+    label.set_text(hk_lbl_cost, "成本 " + str.tostring(hk_avg_cost_hkd, "#.##"))
+
+    // ===== 等效新成本线（做T降本后）=====
+    if hk_cost_reduction_per_share > 0.01
+        if na(hk_line_newcost)
+            hk_line_newcost := line.new(x1, hk_effective_new_cost, x2, hk_effective_new_cost, color=color.new(color.fuchsia, 0), width=1, style=line.style_dashed)
+            hk_lbl_newcost  := label.new(xl, hk_effective_new_cost, "", color=color.new(color.fuchsia, 0), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+        line.set_xy1(hk_line_newcost, x1, hk_effective_new_cost)
+        line.set_xy2(hk_line_newcost, x2, hk_effective_new_cost)
+        label.set_xy(hk_lbl_newcost, xl, hk_effective_new_cost)
+        label.set_text(hk_lbl_newcost, "新成本 " + str.tostring(hk_effective_new_cost, "#.##") + " (降" + str.tostring(hk_cost_reduction_per_share, "#.##") + ")")
+
+    // ===== 加仓区 Z1 (浅回试) — 半透明色块 =====
+    if na(hk_box_z1)
+        hk_box_z1 := box.new(x1, hk_z1_high, x2, hk_z1_low, bgcolor=color.new(color.aqua, 88), border_color=color.new(color.aqua, 50), border_width=1)
+        hk_lbl_z1 := label.new(xl, (hk_z1_high + hk_z1_low) / 2.0, "", color=color.new(color.aqua, 30), textcolor=color.black, style=label.style_label_left, size=size.tiny)
+    box.set_lefttop(hk_box_z1, x1, hk_z1_high)
+    box.set_rightbottom(hk_box_z1, x2, hk_z1_low)
+    label.set_xy(hk_lbl_z1, xl, (hk_z1_high + hk_z1_low) / 2.0)
+    label.set_text(hk_lbl_z1, "Z1 " + str.tostring(hk_z1_low, "#") + "-" + str.tostring(hk_z1_high, "#") + " (15%)")
+
+    // ===== 加仓区 Z2 (中度回踩) =====
+    if na(hk_box_z2)
+        hk_box_z2 := box.new(x1, hk_z2_high, x2, hk_z2_low, bgcolor=color.new(color.blue, 85), border_color=color.new(color.blue, 40), border_width=1)
+        hk_lbl_z2 := label.new(xl, (hk_z2_high + hk_z2_low) / 2.0, "", color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    box.set_lefttop(hk_box_z2, x1, hk_z2_high)
+    box.set_rightbottom(hk_box_z2, x2, hk_z2_low)
+    label.set_xy(hk_lbl_z2, xl, (hk_z2_high + hk_z2_low) / 2.0)
+    label.set_text(hk_lbl_z2, "Z2 " + str.tostring(hk_z2_low, "#") + "-" + str.tostring(hk_z2_high, "#") + " (25%)")
+
+    // ===== 加仓区 Z3 (深度承接) =====
+    if na(hk_box_z3)
+        hk_box_z3 := box.new(x1, hk_z3_high, x2, hk_z3_low, bgcolor=color.new(color.purple, 82), border_color=color.new(color.purple, 30), border_width=1)
+        hk_lbl_z3 := label.new(xl, (hk_z3_high + hk_z3_low) / 2.0, "", color=color.new(color.purple, 10), textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    box.set_lefttop(hk_box_z3, x1, hk_z3_high)
+    box.set_rightbottom(hk_box_z3, x2, hk_z3_low)
+    label.set_xy(hk_lbl_z3, xl, (hk_z3_high + hk_z3_low) / 2.0)
+    label.set_text(hk_lbl_z3, "Z3 " + str.tostring(hk_z3_low, "#") + "-" + str.tostring(hk_z3_high, "#") + " (30%)")
+
+// 信号箭头 (plotshape 不占 plot 配额)
+plotshape(hk_show_signals and is_visible_bar and hk_sell_t_signal, title="HK 高抛T", style=shape.triangledown, location=location.abovebar, color=color.new(color.orange, 0), size=size.small, text="SELL-T", textcolor=color.white)
+plotshape(hk_show_signals and is_visible_bar and hk_buy_t_signal,  title="HK 低吸T", style=shape.triangleup,   location=location.belowbar, color=color.new(color.aqua, 0),   size=size.small, text="BUY-T",  textcolor=color.black)
+
+
+
+// ----------------------------------------------------------------------------
+// 24.7 HK 综合仪表盘 (右上角，与原 panel 不冲突)
+// ----------------------------------------------------------------------------
+
+var table hk_panel = table.new(position=position.top_right, columns=2, rows=27, bgcolor=color.new(color.black, 5), border_width=1, border_color=color.new(color.gray, 40))
+
+if is_panel_bar and hk_show_dashboard and hk_active
+    // === 标题 ===
+    table.cell(hk_panel, 0, 0, "🇭🇰 港股通腾讯 仪表盘", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.maroon, 30))
+    table.cell(hk_panel, 1, 0, "00700.HK v1.0", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.maroon, 30))
+
+    // === 持仓结构 ===
+    table.cell(hk_panel, 0, 1, "持仓结构", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+    table.cell(hk_panel, 1, 1, "Core / Tactical", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+
+    table.cell(hk_panel, 0, 2, "总 / 核心 / 浮仓", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 2, str.tostring(hk_total_qty) + " / " + str.tostring(hk_core_qty) + " / " + str.tostring(hk_tactical_qty), text_color=color.white, text_size=size.tiny)
+
+    table.cell(hk_panel, 0, 3, "持仓成本 / 现价", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 3, str.tostring(hk_avg_cost_hkd, "#.##") + " / " + str.tostring(close, "#.##"), text_color=color.gray, text_size=size.tiny)
+
+    table.cell(hk_panel, 0, 4, "市值 (HKD)", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 4, str.tostring(hk_mkt_value, "#"), text_color=color.aqua, text_size=size.tiny)
+
+    pnl_color = hk_pnl >= 0 ? color.green : color.red
+    table.cell(hk_panel, 0, 5, "浮动盈亏", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 5, str.tostring(hk_pnl, "#") + "  (" + str.tostring(hk_pnl_pct, "#.##") + "%)", text_color=pnl_color, text_size=size.tiny)
+
+    // === 距远期目标 ===
+    table.cell(hk_panel, 0, 6, "距远期目标", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+    table.cell(hk_panel, 1, 6, "需要的涨幅", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+
+    table.cell(hk_panel, 0, 7, "→ T1 " + str.tostring(hk_target_t1, "#"), text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 7, (hk_to_t1_pct >= 0 ? "+" : "") + str.tostring(hk_to_t1_pct, "#.##") + "%", text_color=color.lime, text_size=size.tiny)
+
+    table.cell(hk_panel, 0, 8, "→ T2 " + str.tostring(hk_target_t2, "#"), text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 8, (hk_to_t2_pct >= 0 ? "+" : "") + str.tostring(hk_to_t2_pct, "#.##") + "%", text_color=color.green, text_size=size.tiny)
+
+    table.cell(hk_panel, 0, 9, "→ T3 " + str.tostring(hk_target_t3, "#"), text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 9, (hk_to_t3_pct >= 0 ? "+" : "") + str.tostring(hk_to_t3_pct, "#.##") + "%", text_color=color.green, text_size=size.tiny)
+
+    // === 港股通摩擦精算 ===
+    table.cell(hk_panel, 0, 10, "港股通摩擦精算", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+    table.cell(hk_panel, 1, 10, "@" + str.tostring(hk_friction_pct, "#.##") + "% 双向", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+
+    table.cell(hk_panel, 0, 11, "盈亏平衡价差", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 11, str.tostring(hk_min_breakeven_hkd, "#.##") + " HKD/股", text_color=color.gray, text_size=size.tiny)
+
+    table.cell(hk_panel, 0, 12, "最低有效价差", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 12, str.tostring(hk_min_useful_hkd, "#.##") + " HKD (≥" + str.tostring(hk_min_spread_pct, "#.#") + "%)", text_color=color.lime, text_size=size.tiny)
+
+    table.cell(hk_panel, 0, 13, "单次T目标净利", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 13, "≥" + str.tostring(hk_single_t_min_profit, "#") + " / 理想 " + str.tostring(hk_single_t_target_profit, "#"), text_color=color.lime, text_size=size.tiny)
+
+    // === 实时信号 ===
+    table.cell(hk_panel, 0, 14, "实时信号", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+    table.cell(hk_panel, 1, 14, "评分≥" + str.tostring(hk_min_score) + "/5 触发", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+
+    sell_text = hk_sell_score >= hk_min_score ? "⚡ TRIGGER " + str.tostring(hk_sell_score) + "/5" : "等待 " + str.tostring(hk_sell_score) + "/5"
+    sell_col  = hk_sell_score >= hk_min_score ? color.orange : color.gray
+    table.cell(hk_panel, 0, 15, "高抛 SELL-T", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 15, sell_text, text_color=sell_col, text_size=size.tiny)
+
+    buy_text = hk_buy_score >= hk_min_score ? "🎯 TRIGGER " + str.tostring(hk_buy_score) + "/5" : "等待 " + str.tostring(hk_buy_score) + "/5"
+    buy_col  = hk_buy_score >= hk_min_score ? color.aqua : color.gray
+    table.cell(hk_panel, 0, 16, "低吸 BUY-T", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 16, buy_text, text_color=buy_col, text_size=size.tiny)
+
+    // === 做T配对统计 ===
+    table.cell(hk_panel, 0, 17, "做T配对统计", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+    table.cell(hk_panel, 1, 17, "Round-trip Stats", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.navy, 50))
+
+    table.cell(hk_panel, 0, 18, "已完成 / 胜 / 胜率", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 18, str.tostring(hk_pairs_total) + " / " + str.tostring(hk_pairs_win) + " / " + str.tostring(hk_win_rate, "#.#") + "%", text_color=color.aqua, text_size=size.tiny)
+
+    cum_col = hk_cum_t_net_profit > 0 ? color.green : hk_cum_t_net_profit < 0 ? color.red : color.gray
+    table.cell(hk_panel, 0, 19, "累计净利 / 摩擦", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 19, str.tostring(hk_cum_t_net_profit, "#") + " / " + str.tostring(hk_cum_friction_cost, "#"), text_color=cum_col, text_size=size.tiny)
+
+    table.cell(hk_panel, 0, 20, "平均价差 / 单次净利", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 20, str.tostring(hk_avg_pair_spread, "#.##") + "% / " + str.tostring(hk_avg_pair_profit, "#"), text_color=color.aqua, text_size=size.tiny)
+
+    table.cell(hk_panel, 0, 21, "单股降本 / 等效新成本", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 21, str.tostring(hk_cost_reduction_per_share, "#.##") + " HKD → " + str.tostring(hk_effective_new_cost, "#.##"), text_color=color.lime, text_size=size.tiny)
+
+    t_state_text = na(hk_t_open_price) ? "等待高抛入场" : "已高抛 @" + str.tostring(hk_t_open_price, "#.##") + " (持" + str.tostring(hk_t_holding_bars) + "K)"
+    t_state_col  = na(hk_t_open_price) ? color.gray : color.orange
+    table.cell(hk_panel, 0, 22, "T配对当前状态", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 22, t_state_text, text_color=t_state_col, text_size=size.tiny)
+
+    // === 金字塔区位 ===
+    zone_text = hk_in_z3 ? "🟣 Z3 深度承接 (30%资金)" : hk_in_z2 ? "🔵 Z2 中度回踩 (25%资金)" : hk_in_z1 ? "🔷 Z1 浅回试 (15%资金)" : hk_below_z3 ? "🚨 跌破Z3 → Z4/Z5恐慌区" : hk_above_z1 ? "震荡/反弹区 (不补)" : "区间外"
+    zone_col  = hk_in_z3 ? color.fuchsia : hk_in_z2 ? color.blue : hk_in_z1 ? color.aqua : hk_below_z3 ? color.red : color.gray
+    table.cell(hk_panel, 0, 23, "金字塔区位", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 23, zone_text, text_color=zone_col, text_size=size.tiny)
+
+    // === 综合操作建议 ===
+    advice =
+         close >= hk_target_t3 ? "🎉 触及 T3 → 兑现 " + str.tostring(hk_t3_qty) + " 股" :
+         close >= hk_target_t2 ? "🎉 触及 T2 → 兑现 " + str.tostring(hk_t2_qty) + " 股" :
+         close >= hk_target_t1 ? "🎉 触及 T1 → 兑现 " + str.tostring(hk_t1_qty) + " 股" :
+         hk_sell_t_signal ? "⚡ 卖出浮仓 " + str.tostring(hk_tactical_qty) + " 股" :
+         hk_buy_t_signal and not na(hk_t_open_price) ? "🎯 回补浮仓 (闭合配对)" :
+         hk_buy_t_signal and hk_in_z2 ? "🎯 Z2 信号共振 → 加仓机会" :
+         hk_buy_t_signal and hk_in_z3 ? "🎯 Z3 信号共振 → 重仓加仓机会" :
+         hk_buy_t_signal ? "🎯 低吸建立浮仓" :
+         hk_in_z3 ? "🟣 Z3 区间，等信号低吸" :
+         hk_in_z2 ? "🔵 Z2 区间，等信号低吸" :
+         hk_in_z1 ? "🔷 Z1 区间，等信号低吸" :
+         "持仓观望"
+
+    advice_col =
+         close >= hk_target_t1 ? color.lime :
+         hk_sell_t_signal ? color.orange :
+         hk_buy_t_signal ? color.aqua :
+         hk_in_z2 or hk_in_z3 ? color.fuchsia :
+         color.gray
+    table.cell(hk_panel, 0, 24, "🎯 操作建议", text_color=#FFD700, text_size=size.small, bgcolor=color.new(color.navy, 30))
+    table.cell(hk_panel, 1, 24, advice, text_color=advice_col, text_size=size.small, bgcolor=color.new(color.navy, 30))
+
+    // === 风险提示 ===
+    risk_warn =
+         hk_pnl_pct < -15 ? "🚨 浮亏 >15% 复审基本面" :
+         hk_pnl_pct < -10 ? "⚠️ 浮亏 >10% 警戒" :
+         not na(hk_t_open_price) and hk_t_holding_bars > 15 ? "⏰ 浮仓>15K未平 注意止损" :
+         hk_to_t3_pct < 5 ? "✅ 接近止盈区" :
+         "正常"
+    risk_col =
+         hk_pnl_pct < -15 ? color.red :
+         hk_pnl_pct < -10 ? color.orange :
+         hk_to_t3_pct < 5 ? color.green :
+         color.gray
+    table.cell(hk_panel, 0, 25, "风险状态", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 25, risk_warn, text_color=risk_col, text_size=size.tiny)
+
+    // === 触及目标潜在收益预览 ===
+    table.cell(hk_panel, 0, 26, "T1/T2/T3 兑现 (HKD)", text_color=color.white, text_size=size.tiny)
+    table.cell(hk_panel, 1, 26, str.tostring(hk_t1_realize / 10000.0, "#.#") + "万 / " + str.tostring(hk_t2_realize / 10000.0, "#.#") + "万 / " + str.tostring(hk_t3_realize / 10000.0, "#.#") + "万", text_color=color.lime, text_size=size.tiny)
+
+
+// ----------------------------------------------------------------------------
+// 24.8 HK 模块专属警报
+// ----------------------------------------------------------------------------
+
+alertcondition(hk_sell_t_signal, title="🇭🇰 高抛T信号触发", message="腾讯港股通: SELL-T 信号触发 (评分≥3/5)，浮仓1000股可考虑高抛")
+alertcondition(hk_buy_t_signal,  title="🇭🇰 低吸T信号触发", message="腾讯港股通: BUY-T 信号触发 (评分≥3/5)，可考虑低吸建仓/补仓")
+
+alertcondition(close >= hk_target_t1 and close[1] < hk_target_t1, title="🇭🇰 触及止盈T1 (600)", message="腾讯: 触及阶梯止盈 Tier 1 (600 HKD)，启动减仓 21%")
+alertcondition(close >= hk_target_t2 and close[1] < hk_target_t2, title="🇭🇰 触及止盈T2 (650)", message="腾讯: 触及阶梯止盈 Tier 2 (650 HKD)，启动减仓 26%")
+alertcondition(close >= hk_target_t3 and close[1] < hk_target_t3, title="🇭🇰 触及止盈T3 (700)", message="腾讯: 触及阶梯止盈 Tier 3 (700 HKD)，启动减仓 21%，剩余奔跑仓启用追踪止损")
+
+alertcondition(close <= hk_z1_high and close[1] > hk_z1_high, title="🇭🇰 进入加仓区Z1", message="腾讯: 进入 Z1 浅回试加仓区 (444-450 HKD)")
+alertcondition(close <= hk_z2_high and close[1] > hk_z2_high, title="🇭🇰 进入加仓区Z2", message="腾讯: 进入 Z2 中度回踩加仓区 (425-443 HKD)")
+alertcondition(close <= hk_z3_high and close[1] > hk_z3_high, title="🇭🇰 进入加仓区Z3", message="腾讯: 进入 Z3 深度承接加仓区 (405-424 HKD)")
+alertcondition(close <  hk_z3_low  and close[1] >= hk_z3_low,  title="🇭🇰 跌破Z3进入恐慌区",   message="腾讯: 跌破 Z3 下沿，进入 Z4/Z5 极端恐慌区，复审基本面")
+
+alertcondition(hk_pnl_pct < -10 and hk_pnl_pct[1] >= -10, title="🇭🇰 浮亏警戒10%", message="腾讯: 总持仓浮亏跌破 -10%，进入警戒区")
+
+// ============================================================================
+// HK MODULE END
+// ============================================================================
